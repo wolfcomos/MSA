@@ -95,7 +95,7 @@ void k2_merge(at::Tensor cand, at::Tensor out, int64_t head_offset,
   // C7 pins head_offset even though the source-major carrier no longer needs it.
   TORCH_CHECK(head_offset == rank * Hl,
               "C7 pins head_offset = icp_rank * H_local; got ", head_offset);
-  TORCH_CHECK(C * K <= 32, "the merge holds one candidate per lane (W <= 2)");
+  TORCH_CHECK(C == 1 || C == 2 || C == 4, "the merge supports W in {1, 2, 4}");
 
   TORCH_CHECK(status.is_cuda(), "status must be a CUDA tensor");
   TORCH_CHECK(status.scalar_type() == at::kInt, "status must be int32");
@@ -132,7 +132,11 @@ void k2_merge(at::Tensor cand, at::Tensor out, int64_t head_offset,
   const int32_t* cp = cand.data_ptr<int32_t>();
   int32_t* op = out.data_ptr<int32_t>();
   int32_t* sp = status.data_ptr<int32_t>();
-  k2_merge_kernel<1><<<blocks, kThreads, 0, stream>>>(cp, op, fp, np, sp, C, T, K, Hl);
+  if (C <= 2) {
+    k2_merge_kernel<1><<<blocks, kThreads, 0, stream>>>(cp, op, fp, np, sp, C, T, K, Hl);
+  } else {
+    k2_merge_kernel<2><<<blocks, kThreads, 0, stream>>>(cp, op, fp, np, sp, C, T, K, Hl);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

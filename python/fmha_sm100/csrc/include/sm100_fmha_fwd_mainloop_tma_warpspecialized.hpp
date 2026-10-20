@@ -311,9 +311,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   static constexpr int StageCountKV_prefill = kv_stage_count_of<Mask_>::value
       ? kv_stage_count_of<Mask_>::value : StageCountKV_shipped;
   static_assert(kv_stage_count_of<Mask_>::value == 0 ||
-                (kNeedIcp && !IsSplitKV && sizeof(Element_) == 1 && KVPageSize == 64
+                (kNeedIcp && !IsSplitKV && sizeof(Element_) == 1
+                 && (KVPageSize == 32 || KVPageSize == 64)
                  && get<0>(ThreadShape{}) == 1 && get<1>(ThreadShape{}) == 2),
-                "the deep K ring is restricted to the OnlyScoreIcp FP8 page-64 prefill scorer");
+                "the deep K ring is restricted to the OnlyScoreIcp FP8 prefill scorer");
 
   static constexpr bool kDequantProducesKV = k2::kDequantProducesKV;
   static constexpr int StageCountKV =
@@ -974,10 +975,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     static auto _dummy_tStS_P() { return _dummy_tStS().compose(make_layout(make_shape(_128{}, _tilePlikeFP32()))); }
 
     using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b32x;
-    // The P tile is get<1>(TileShapeQK)/4 * sizeof(Element) columns: 16 for the page-64 ICP scorer.
+    // FP8 R32/R64 fragments have 8/16 packed P columns.
     using TMEM_STORE = std::conditional_t<(decltype(_tilePlikeFP32())::value >= 32),
                                           SM100_TMEM_STORE_32dp32b32x,
-                                          SM100_TMEM_STORE_32dp32b16x>;
+                                          std::conditional_t<(decltype(_tilePlikeFP32())::value >= 16),
+                                              SM100_TMEM_STORE_32dp32b16x,
+                                              SM100_TMEM_STORE_32dp32b8x>>;
     using TMEM_STORE_V = SM100_TMEM_STORE_32dp32b2x;
 
     static auto _dummy_load() { return make_tmem_copy(TMEM_LOAD{}, _dummy_tStS()); }

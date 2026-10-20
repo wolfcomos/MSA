@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TP2/ICP2 compact-fragment decode scorer (FP8 E4M3, H4, D128), TMA + mma.sync.
+"""TP2/TP4 P128 index-fragment decode scorer (FP8 E4M3, H4, D128).
 
 Adapted from vLLM IndexDecodeScoreKernel at 9de0daa25f47; mma.sync rather than
 tcgen05 because the score GEMM's tiny N favours CTA occupancy over a deep pipeline.
@@ -161,8 +161,6 @@ def _fp8_to_f16_mma_fragments(src: cute.Tensor):
 
 
 class IndexDecodeScoreKernel:
-    BLOCK_K = 64
-    NUM_COMPUTE_WARPS = 2
     BAR_MMA = 1
     num_stages = 2
 
@@ -175,6 +173,8 @@ class IndexDecodeScoreKernel:
         head_dim: int = 128,
         *, query_len: int, rank: int,
         num_stages: int = 2,
+        page_size: int = 128,
+        world_size: int = 2,
     ):
         self.dtype = dtype
         self.num_heads = num_heads
@@ -183,6 +183,11 @@ class IndexDecodeScoreKernel:
         self.head_dim = head_dim
         self.query_len = query_len
         self.rank = rank
+        assert world_size in (2, 4) and page_size == 128
+        assert 0 <= rank < world_size
+        self.page_size = page_size
+        self.BLOCK_K = page_size // world_size
+        self.NUM_COMPUTE_WARPS = self.BLOCK_K // 32
         # K fragments in flight per CTA; decode scoring is latency bound.
         self.num_stages = num_stages
 
@@ -325,7 +330,7 @@ class IndexDecodeScoreKernel:
         pre_end = Int32(0)
         # Blocks [0, n_old) end before this request's first new token, so
         # this step's writer does not touch their index rows.
-        n_old = (seqlen - (qe - qb)) // 128
+        n_old = (seqlen - (qe - qb)) // self.page_size
         if split_id < n_old:
             n_pre = (n_old - split_id + split_k - 1) // split_k
             if n_pre > num_stages:  # noqa: PLR1730
@@ -380,7 +385,8 @@ class IndexDecodeScoreKernel:
                         max_position = p if p > max_position else max_position
         visible_end = Int64(seqlen) if seqlen < max_position + 1 else max_position + 1
         visible_end = visible_end if visible_end > 0 else Int64(0)
-        num_blocks = Int32(visible_end // 128 + Int64(visible_end % 128 > self.rank * BLOCK_K))
+        num_blocks = Int32(visible_end // self.page_size
+                          + Int64(visible_end % self.page_size > self.rank * BLOCK_K))
         # Pre-issued fragments are always consumed; their stores stay masked
         # by the exact causal bound below.
         if num_blocks < pre_end:  # noqa: PLR1730
@@ -524,7 +530,7 @@ class IndexDecodeScoreKernel:
                     cute.arch.fence_view_async_shared()
                     cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
 
-                    k_start = block_id * 128 + self.rank * BLOCK_K + warp_id * 32
+                    k_start = block_id * self.page_size + self.rank * BLOCK_K + warp_id * 32
 
                     # The exact causal mask, including suppression of NaNs in
                     # future K rows.
@@ -578,7 +584,7 @@ class IndexDecodeScoreKernel:
                             )
 
                         t = qb + q_local_pos - token_begin
-                        first_key = block_id * 128 + self.rank * BLOCK_K
+                        first_key = block_id * self.page_size + self.rank * BLOCK_K
                         if first_key <= query_positions[q_local_pos] and first_key < seqlen:
                             score[t, head_id, block_id] = final_score
                             valid[t, head_id, block_id] = Uint8(1)

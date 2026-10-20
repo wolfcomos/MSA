@@ -124,7 +124,7 @@ __global__ void __launch_bounds__(kFullRowThreads) fused_select_publish_kernel(
 
 // Poll + merge, one warp per (token, local head) row. `mybuf` is this rank's
 // window at this slot; `exp_gen` this slot's [T_cap][H_local] plane. One
-// candidate per lane (W <= 2), merged by the shuffle network.
+// candidate per lane for W <= 2, two for W = 4.
 template <int KPT>
 __global__ __launch_bounds__(kMergeThreads, kMergeMinBlocksPerSm) void fused_merge_kernel(
     const uint64_t* __restrict__ mybuf, int32_t* __restrict__ out,

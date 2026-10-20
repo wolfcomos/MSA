@@ -1585,21 +1585,21 @@ class _IcpDevicePlanStore:
         }
 
 
-def _icp_scorer_variants():
+def _icp_scorer_variants(page_size=_ICP_PAGE_SIZE):
     """``(variant_name, get_fmha_variant args)`` of both FP8 OnlyScoreIcp scorers."""
     from .jit import _variant_key_from_runtime
 
     code = _dlpack_dtype_code(torch.float8_e4m3fn)
     variants = []
     for single_wg in (True, False):
-        args = (code, _ICP_QO_TILE, single_wg, 4, _ICP_PAGE_SIZE, False, 1)
+        args = (code, _ICP_QO_TILE, single_wg, 4, page_size, False, 1)
         variants.append((_variant_key_from_runtime(*args)[0], args))
     return variants
 
 
 def _fmha_sm100_icp_plan(qo_segment_lens, num_qo_heads, *, icp_rank, block_table,
                          block_table_row_stride, block_table_row_begin, device_plan,
-                         max_k_tiles):
+                         max_k_tiles, page_size=_ICP_PAGE_SIZE, world_size=_ICP_WORLD_SIZE):
     """Host-only plan of one chunk over the writer-filled ``device_plan`` slot; no device read."""
     qo_lens = qo_segment_lens.tolist()
     max_qo_len = max(qo_lens)
@@ -1623,6 +1623,8 @@ def _fmha_sm100_icp_plan(qo_segment_lens, num_qo_heads, *, icp_rank, block_table
             device_plan.store.device, torch.uint8))
     info.update(
         icp_rank=int(icp_rank),
+        icp_world_size=int(world_size),
+        icp_page_size=int(page_size),
         block_table=block_table,
         block_table_row_stride=int(block_table_row_stride),
         block_table_row_begin=int(block_table_row_begin),
@@ -1631,10 +1633,10 @@ def _fmha_sm100_icp_plan(qo_segment_lens, num_qo_heads, *, icp_rank, block_table
 
 
 def _fmha_sm100_icp(q, k, plan_info, *, max_score, valid_score, sm_scale, qo_offset):
-    """Write this rank's max scores and validity ``[T, H, max_k_tiles]``; ``k`` is ``[pages, 1, 64, D]``."""
+    """Write rank-local scores and validity; ``k`` is ``[pages, 1, fragment_rows, D]``."""
     max_qo_len = plan_info["max_qo_len"]
     variant = get_fmha_variant(_dlpack_dtype_code(q.dtype), _ICP_QO_TILE, max_qo_len <= 64,
-                               4, _ICP_PAGE_SIZE, False, 1)
+                               4, plan_info["icp_page_size"], False, 1)
     variant.run(
         plan_info["cute_workspace_buffer"],
         q, k, k,
@@ -1661,5 +1663,5 @@ def _fmha_sm100_icp(q, k, plan_info, *, max_score, valid_score, sm_scale, qo_off
         plan_info["block_table_row_stride"],
         plan_info["block_table_row_begin"],
         plan_info["icp_rank"],
-        _ICP_WORLD_SIZE,
+        plan_info["icp_world_size"],
     )

@@ -1,4 +1,4 @@
-"""Markers and fixtures for the ICP tests: `gpu` needs CUDA, `distributed` needs 2 ranks."""
+"""Markers and fixtures for the ICP tests: `gpu` needs CUDA, `distributed` needs 2 or 4 ranks."""
 
 import os
 
@@ -8,7 +8,7 @@ import torch
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "gpu: needs a CUDA device and builds ICP kernels")
-    config.addinivalue_line("markers", "distributed: needs 2 ranks under torchrun")
+    config.addinivalue_line("markers", "distributed: needs 2 or 4 ranks under torchrun")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -29,11 +29,11 @@ def cuda_device():
 
 @pytest.fixture(scope="session")
 def icp_group(cuda_device):
-    """The NCCL world group of `torchrun --nproc_per_node=2 -m pytest ...`."""
+    """The NCCL world group under torchrun with two or four ranks."""
     import torch.distributed as dist
 
-    if int(os.environ.get("WORLD_SIZE", "1")) != 2:
-        pytest.skip("needs exactly 2 ranks (torchrun --nproc_per_node=2)")
+    if int(os.environ.get("WORLD_SIZE", "1")) not in (2, 4):
+        pytest.skip("needs 2 or 4 ranks under torchrun")
     if os.environ.get("TORCH_SYMM_MEM_ALLOW_OVERLAPPING_DEVICES"):
         pytest.fail("unset TORCH_SYMM_MEM_ALLOW_OVERLAPPING_DEVICES: it disables NVLS multicast")
     if not dist.is_initialized():

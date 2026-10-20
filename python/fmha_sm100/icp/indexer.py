@@ -1,4 +1,4 @@
-"""TP2 indexer context parallelism: one plan per step; score, select, exchange per layer."""
+"""Indexer context parallelism: one plan per step; score, select, exchange per layer."""
 
 from __future__ import annotations
 
@@ -7,13 +7,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 
 from .. import api
 from . import _build
 from .exchange import _SLOTS, _Exchange
 from .scorer.decode import icp_decode_score
 
-# Page size == sparse block size == index-K block; fmha tile id == M3 block id.
+# Logical index pages and sparse ranking blocks both cover 128 tokens.
 _PAGE = 128
 # Inner MSA tile; the planner pins it to 128 whenever icp_c > 1.
 _QO_TILE = 128
@@ -83,24 +84,34 @@ class IcpStep:
 
 
 class IcpIndexer:
-    """One per model: TP2 ICP sparse indexer; owns plan store, score arena, D3 window, carriers."""
+    """One per model: ICP sparse indexer; owns plan store, score arena, D3 window, carriers."""
 
     #: D3 build facts for the startup log; ``kernel`` is ``"d3_fused"``.
     provenance: dict
 
     def __init__(self, *, group, rank: int, topk_buffer: torch.Tensor, num_sparse_layers: int,
                  index_head_dim: int, max_model_len: int, max_num_batched_tokens: int,
-                 max_num_seqs: int, cudagraph_capture_sizes) -> None:
+                 max_num_seqs: int, cudagraph_capture_sizes, page_size: int = 128,
+                 control_group=None) -> None:
         """Collective (D3 rendezvous); ``topk_buffer`` is the shared ``[T_cap, H_local, 16]``."""
         # With no ACK, a sweep whose wrap repeats a slot would race silently.
         if num_sparse_layers % _SLOTS == 1:
             raise ValueError(f"ICP: {num_sparse_layers} sparse layers repeat a D3 slot "
                              f"across the wrap of {_SLOTS} slots")
+        self._world = dist.get_world_size(group)
+        if self._world not in (2, 4) or page_size != _PAGE:
+            raise ValueError("ICP requires TP2/TP4 and 128-token index pages")
+        if rank != dist.get_rank(group):
+            raise ValueError("ICP rank must be the rank within its process group")
+        self._page_size = page_size
+        self._fragment = page_size // self._world
         self._rank, self._topk, self._head_dim = rank, topk_buffer, index_head_dim
         self._hl = topk_buffer.shape[1]
-        self._hg = 2 * self._hl
+        self._hg = self._world * self._hl
+        if self._hg != 4:
+            raise ValueError("ICP decode scoring requires four global index heads")
         self._max_num_seqs = max_num_seqs
-        self._max_blocks = _cdiv(max_model_len, _PAGE)
+        self._max_blocks = _cdiv(max_model_len, page_size)
         cap = _align4(max_num_batched_tokens)
         # Rank-identical exchange extents: capture sizes + powers of two (decode), octaves (prefill).
         decode, eager = {_align4(s) for s in cudagraph_capture_sizes or () if 0 < s <= cap}, 4
@@ -111,7 +122,8 @@ class IcpIndexer:
         self._prefill_caps = _ladder(cap, _align4)
         self._exchange = _Exchange(
             group, rank=rank, heads_local=self._hl, device=topk_buffer.device,
-            extents=sorted({*self._decode_caps, *self._prefill_caps}))
+            extents=sorted({*self._decode_caps, *self._prefill_caps}),
+            control_group=control_group)
         self.provenance = self._exchange.provenance
         self._allocated = False
 
@@ -178,11 +190,12 @@ class IcpIndexer:
 
         capability = tuple(torch.cuda.get_device_capability(device.index))
         self._scans = {
-            q: icp_decode_score._compile_scan(q, self._rank, device.index, capability)
+            q: icp_decode_score._compile_scan(
+                q, self._rank, device.index, capability, self._page_size, self._world)
             for q in range(1, min(_MAX_CUTE_QUERY_LEN, max_decode_query_len) + 1)
         }
         self._select = _build._select_ext()
-        for _, args in api._icp_scorer_variants():
+        for _, args in api._icp_scorer_variants(self._fragment):
             api.get_fmha_variant(*args)
         _logger.info(
             "ICP_INDEXER rank=%d decode_chunk=%d prefill_waves=%s plan_slots=%d "
@@ -215,7 +228,7 @@ class IcpIndexer:
         if has_prefill:
             kv_max = max(1, int(kv_ub.max()) if num_reqs else 1)
             # The smallest column rung covering the host-bounded live extent.
-            columns = next(c for c in self._columns if c >= min(_cdiv(kv_max, _PAGE), nb))
+            columns = next(c for c in self._columns if c >= min(_cdiv(kv_max, self._page_size), nb))
             width = self._waves[columns]
             scores, valid = self._prefill_views[columns]
         else:
@@ -242,7 +255,7 @@ class IcpIndexer:
                 continue
             has_fmha = True
             last_position = int((kv_ub[sel] - q_end[sel] + hi[sel] - 1).max())
-            chunk_live_blocks = min(_cdiv(last_position + 1, _PAGE), nb)
+            chunk_live_blocks = min(_cdiv(last_position + 1, self._page_size), nb)
             score_extent = chunk_live_blocks if has_prefill else nb
             plan = api._fmha_sm100_icp_plan(
                 (hi[sel] - lo[sel]).to(torch.int32),
@@ -253,6 +266,8 @@ class IcpIndexer:
                 block_table_row_begin=int(sel[0]),
                 device_plan=self._store.slot(slot),
                 max_k_tiles=score_extent,
+                page_size=self._fragment,
+                world_size=self._world,
             )
             live = min(t1, live_tokens) - t0
             score = self._fmha(plan, t0, live, scores[:live, :, :score_extent],
@@ -317,7 +332,7 @@ class IcpIndexer:
                layer: int, scale: float) -> None:
         """Score, select and exchange one sparse layer into ``topk_buffer[:token_capacity]``."""
         q = index_q[: step._num_tokens].view(step._num_tokens, self._hg, self._head_dim)
-        # `unsqueeze`, not `view`: the index region carries the compound page stride.
+        # Preserve the caller's index-page stride, including sliced cache views.
         k_pages = index_k.unsqueeze(1)
         for score, pick in step._windows:
             score(q, index_k, k_pages, scale)

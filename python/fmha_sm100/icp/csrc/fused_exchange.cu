@@ -17,8 +17,9 @@ namespace F = icp::fused;
 
 int cdiv(long a, long b) { return (int)((a + b - 1) / b); }
 
-// The merge's resident-CTA cap per device; one candidate per lane (W <= 2).
-int resident_ctas() {
+// The merge's resident-CTA cap per device and candidates per lane.
+template <int KPT>
+int resident_ctas_for() {
   int dev = 0;
   C10_CUDA_CHECK(cudaGetDevice(&dev));
   static std::mutex mu;
@@ -30,16 +31,20 @@ int resident_ctas() {
     int per_sm = 0;
     C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
     C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &per_sm, F::fused_merge_kernel<1>, F::kMergeThreads, 0));
+        &per_sm, F::fused_merge_kernel<KPT>, F::kMergeThreads, 0));
     TORCH_CHECK(per_sm >= 1, "fused merge cannot be resident on device ", dev);
     cache[dev] = sms * per_sm;
   }
   return cache[dev];
 }
 
+int resident_ctas(int64_t world) {
+  return world <= 2 ? resident_ctas_for<1>() : resident_ctas_for<2>();
+}
+
 void check_world(int64_t world) {
-  TORCH_CHECK(world == 1 || world == 2,
-              "fused: the merge holds one candidate per lane, so world must be 1 or 2");
+  TORCH_CHECK(world == 1 || world == 2 || world == 4,
+              "fused: world must be 1, 2 or 4");
 }
 
 F::PeerWindows peer_windows(const std::vector<int64_t>& ptrs, int64_t world) {
@@ -76,7 +81,7 @@ std::vector<int64_t> fused_plan(int64_t T, int64_t T_cap, int64_t Hl,
   const int tt = F::merge_tile_tokens((int)Hl);
   const int ntiles = cdiv(T, tt);
   check_world(world);
-  const int cap = max_ctas > 0 ? (int)max_ctas : resident_ctas();
+  const int cap = max_ctas > 0 ? (int)max_ctas : resident_ctas(world);
   const int grid = ntiles < cap ? ntiles : cap;
   return {tt, ntiles, grid, cap};
 }
@@ -200,7 +205,7 @@ void fused_merge(at::Tensor out, int64_t own_buf_ptr, at::Tensor exp_gen,
   const c10::cuda::CUDAGuard guard(device);
   const int tt = F::merge_tile_tokens((int)Hl);
   const int ntiles = cdiv(T, tt);
-  const int cap = max_ctas > 0 ? (int)max_ctas : resident_ctas();
+  const int cap = max_ctas > 0 ? (int)max_ctas : resident_ctas(world);
   const int grid = ntiles < cap ? ntiles : cap;
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3(grid);
@@ -215,10 +220,17 @@ void fused_merge(at::Tensor out, int64_t own_buf_ptr, at::Tensor exp_gen,
   int32_t* const outp = out.data_ptr<int32_t>();
   int32_t* const statp = status.data_ptr<int32_t>();
 
-  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, F::fused_merge_kernel<1>, mybuf, outp, fp, np,
-                                    gp, statp, (int)world, (int)T, (int)tokens_capacity,
-                                    (int)Hl, tt, ntiles, (int)flags,
-                                    (long long)spin_cycles));
+  if (world <= 2) {
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, F::fused_merge_kernel<1>, mybuf, outp, fp, np,
+                                      gp, statp, (int)world, (int)T, (int)tokens_capacity,
+                                      (int)Hl, tt, ntiles, (int)flags,
+                                      (long long)spin_cycles));
+  } else {
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, F::fused_merge_kernel<2>, mybuf, outp, fp, np,
+                                      gp, statp, (int)world, (int)T, (int)tokens_capacity,
+                                      (int)Hl, tt, ntiles, (int)flags,
+                                      (long long)spin_cycles));
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

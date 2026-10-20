@@ -652,6 +652,8 @@ struct Sm100FmhaLoadTmaWarpspecialized {
         num_pages_batch = kv_page_end - kv_page_start;
       }
       constexpr int effective_tile_kv = get<1>(TileShapeQK{});
+      static_assert(KVPageSize >= effective_tile_kv && KVPageSize % effective_tile_kv == 0,
+                    "A paged K tile must fit within one physical page");
       constexpr int tiles_per_page = KVPageSize / effective_tile_kv;
 
       int kv_block_offset = 0;

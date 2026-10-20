@@ -13,11 +13,15 @@ HL, NB, CAP = 2, 128, 2048  # local heads; max_model_len 16384 / page 128; batch
 
 
 class _Exchange:
-    def __init__(self, group, *, rank, heads_local, extents, device):
+    def __init__(self, group, *, rank, heads_local, extents, device, control_group=None):
         self.extents, self.calls, self.provenance = extents, [], {"kernel": "d3_fused"}
+        self.geometry = []
+        self.control_group = control_group
 
-    def publish(self, scores, nvalid, forced_column, active, *, layer, token_offset):
+    def publish(self, scores, nvalid, forced_column, active, *, layer, token_offset,
+                block_begin=0, block_stride=1):
         self.calls.append(("publish", layer, token_offset, scores.shape[0]))
+        self.geometry.append((block_begin, block_stride))
 
     def merge_decode(self, out, *, layer, forced, n_ordinary):
         self.calls.append(("merge_decode", layer, out.shape[0]))
@@ -38,7 +42,7 @@ def make(monkeypatch):
     monkeypatch.setattr(ix, "_PREFILL_SCORE_BYTES", 8 << 20)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 7))
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: SimpleNamespace(cuda_stream=7))
-    monkeypatch.setattr(icp_decode_score, "_compile_scan", lambda q, r, d, a: (
+    monkeypatch.setattr(icp_decode_score, "_compile_scan", lambda q, r, d, a, page_size=128, world_size=2: (
         lambda *args: calls.append(("cute", q, args[9:13]))))
     monkeypatch.setattr(ix._build, "_select_ext", lambda: SimpleNamespace(
         select_prefill_candidates=lambda *a, **k: calls.append(("select", a[0].shape, a[5:], k))))
@@ -48,11 +52,13 @@ def make(monkeypatch):
     workspace = torch.empty(32 << 20, dtype=torch.uint8)
     monkeypatch.setattr(api, "_alloc_workspace_buf", lambda *args: workspace)
 
-    def build(layers=5, capture=(1, 2, 4, 8, 16, 32, 64)):
-        indexer = IcpIndexer(group=None, rank=1, topk_buffer=torch.zeros(CAP, HL, 16, dtype=torch.int32),
+    def build(layers=5, capture=(1, 2, 4, 8, 16, 32, 64), page_size=128, world_size=2, rank=1, control_group=None):
+        monkeypatch.setattr(ix.dist, "get_world_size", lambda group: world_size)
+        monkeypatch.setattr(ix.dist, "get_rank", lambda group: rank)
+        indexer = IcpIndexer(group=None, rank=rank, topk_buffer=torch.zeros(CAP, 4 // world_size, 16, dtype=torch.int32),
                              num_sparse_layers=layers, index_head_dim=128, max_model_len=NB * 128,
                              max_num_batched_tokens=CAP, max_num_seqs=64,
-                             cudagraph_capture_sizes=capture)
+                             cudagraph_capture_sizes=capture, page_size=page_size, control_group=control_group)
         indexer.allocate(max_decode_query_len=4)
         calls.clear()
         return indexer, calls
@@ -73,7 +79,8 @@ def _plan(indexer, query_lens, seq_lens, prefill, num_tokens=None, table=None):
 def _select(indexer, step, layer=4):
     tokens = step._num_tokens
     fp8 = torch.float8_e4m3fn
-    indexer.select(step, torch.zeros(tokens, 2 * HL * 128, dtype=fp8), torch.zeros(10, 64, 128, dtype=fp8),
+    indexer.select(step, torch.zeros(tokens, 2 * HL * 128, dtype=fp8),
+                   torch.zeros(10, indexer._fragment, 128, dtype=fp8),
                    layer=layer, scale=0.5)
     return indexer._exchange.calls
 
@@ -148,3 +155,63 @@ def test_block_table_identity_is_latched(make):
     _plan(indexer, [1], [10], [False], table=first)
     with pytest.raises(RuntimeError, match="moved"):
         _plan(indexer, [1], [10], [False], table=torch.zeros(64, NB, dtype=torch.int32))
+
+
+@pytest.mark.parametrize("world_size,rank", [(w, r) for w in (2, 4) for r in range(w)])
+def test_p128_plan_keeps_global_block_ids_and_uses_rank_fragments(make, world_size, rank):
+    control = object()
+    indexer, calls = make(world_size=world_size, rank=rank, control_group=control)
+    assert (indexer._world, indexer._hl, indexer._hg, indexer._fragment) == (
+        world_size, 4 // world_size, 4, 128 // world_size)
+    assert indexer._exchange.control_group is control
+    step = _plan(indexer, [1, 2, 1], [300, 129, 5], [False] * 3)
+    _select(indexer, step)
+    (_, key, args), = calls
+    assert key == api._icp_scorer_variants(128 // world_size)[0][1]
+    assert args[2].shape == (10, 1, 128 // world_size, 128)
+    assert args[28].shape == (4, 4, NB)
+    assert args[-2:] == (rank, world_size)
+    assert indexer._exchange.geometry == [(0, 1)]
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_p128_prefill_candidates_keep_global_block_ids(make, world_size):
+    indexer, calls = make(world_size=world_size)
+    step = _plan(indexer, [100, 1], [100, 1000], [True, False])
+    _select(indexer, step)
+    fmha, select = calls
+    assert fmha[2][29] == 8
+    assert select[2] == (0, False)
+    assert select[3] == {"global_block_stride": 1}
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_other_physical_page_sizes_are_rejected(make, world_size):
+    with pytest.raises(ValueError, match="128-token index pages"):
+        make(page_size=256, world_size=world_size)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_prewarm_contains_only_indexer_artifacts(monkeypatch, world_size):
+    from fmha_sm100.icp import prewarm
+
+    monkeypatch.setattr(prewarm._build, "arch", lambda: "103a")
+    artifacts = prewarm._artifacts(None, world_size=world_size)
+    assert len(artifacts) == len(prewarm._build.EXTENSIONS) + 2 + 4 * world_size
+    labels = [name for name, _ in artifacts]
+    assert len(set(labels)) == len(labels)
+    assert all(name.startswith(("icp:", "fmha:OnlyScoreIcp", "decode:")) for name in labels)
+    for q in range(1, 5):
+        for rank in range(world_size):
+            assert "decode:" + icp_decode_score._aot_function_name(q, rank, 128, world_size) in labels
+
+
+@pytest.mark.parametrize("fragment", [32, 64])
+def test_prefill_tiles_fit_rank_pages(fragment):
+    from fmha_sm100 import jit
+
+    for _, args in api._icp_scorer_variants(fragment):
+        _, params = jit._variant_key_from_runtime(*args)
+        stage_columns = int(params["tile_kv"].removeprefix("_")) // 2
+        assert stage_columns == fragment
+        assert not jit._FMHA_SM100_IMPOSSIBLE(params)

@@ -188,13 +188,6 @@ def aot_object_path(key: tuple) -> str:
 
 
 def try_load_aot(key: tuple):
-    loaded = _try_load_aot(key)
-    if loaded is None and os.environ.get("ICP_RUNTIME_JIT") == "fail":
-        raise RuntimeError(f"runtime JIT of nvfp4:{key[0]} refused (ICP_RUNTIME_JIT=fail)")
-    return loaded
-
-
-def _try_load_aot(key: tuple):
     if _AOT_DISABLE:
         return None
     obj_path = _valid_object(key)

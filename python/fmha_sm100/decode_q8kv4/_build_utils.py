@@ -259,8 +259,6 @@ def _probe_qmul4(nvcc: Path, arch: str, probe_dir: Path) -> bool:
     result_path = probe_dir / "qmul4.result"
     if result_path.is_file():
         return result_path.read_text(encoding="utf-8").strip() == "supported"
-    if os.environ.get("ICP_RUNTIME_JIT") == "fail":
-        raise RuntimeError("runtime JIT of q8kv4:qmul4_probe refused (ICP_RUNTIME_JIT=fail)")
 
     probe_dir.mkdir(parents=True, exist_ok=True)
     source_path = probe_dir / "qmul4_probe.cu"

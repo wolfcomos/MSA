@@ -308,8 +308,6 @@ class JitSpec:
         return tvm_ffi.load_module(str(self.build()))
 
     def _build(self, cache_dir: Path) -> Path:
-        if os.environ.get("ICP_RUNTIME_JIT") == "fail":
-            raise RuntimeError(f"runtime JIT of q8kv4:{self.uri} refused (ICP_RUNTIME_JIT=fail)")
         params = self._params
         inst_template = jinja2.Template(
             (_TEMPLATES / "decode_attention_inst.cu.jinja").read_text()
@@ -429,8 +427,6 @@ def _build_fixed_module(component: str, source: Path, label: str, arch: str):
     dequant_mode = _dequant_mode(arch)
 
     def build(cache_dir: Path) -> Path:
-        if os.environ.get("ICP_RUNTIME_JIT") == "fail":
-            raise RuntimeError(f"runtime JIT of q8kv4:{component} refused (ICP_RUNTIME_JIT=fail)")
         so_path = cache_dir / f"{component}.so"
         _write_ninja(cache_dir, so_path, [source], dequant_mode, arch)
         _run_ninja(cache_dir, label)

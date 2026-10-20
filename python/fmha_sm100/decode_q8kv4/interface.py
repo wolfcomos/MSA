@@ -157,12 +157,8 @@ def _select_num_kv_splits(
 def _jit_compile_cpp_backend():
     """JIT-compile the C++ backend using torch.utils.cpp_extension.load()."""
     import tvm_ffi
-    from torch.utils.cpp_extension import _get_build_directory, load
+    from torch.utils.cpp_extension import load
 
-    name = "_fmha_sm100_decode_q8kv4_cpp"
-    if os.environ.get("ICP_RUNTIME_JIT") == "fail" and not os.path.isfile(
-            os.path.join(_get_build_directory(name, False), f"{name}.so")):
-        raise RuntimeError(f"runtime JIT of q8kv4:{name} refused (ICP_RUNTIME_JIT=fail)")
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     csrc_dir = os.path.join(pkg_dir, "csrc")
     tvm_ffi_dir = os.path.dirname(tvm_ffi.__file__)
@@ -175,7 +171,7 @@ def _jit_compile_cpp_backend():
 
     started_at = time.time()
     cpp = load(
-        name=name,
+        name="_fmha_sm100_decode_q8kv4_cpp",
         sources=[
             os.path.join(csrc_dir, "api", "decode_attention_api.cpp"),
             os.path.join(csrc_dir, "api", "decode_attention_binding.cpp"),
@@ -248,7 +244,6 @@ def _prepare_decode_plan(
     topk: int,
     num_kv_splits: int | None = None,
     usable_sm_count: int | None = None,
-    split_mode: str | None = None,
 ):
     """Prepare the opaque reusable schedule used by the public wrapper."""
     from . import jit
@@ -281,7 +276,7 @@ def _prepare_decode_plan(
         usable_sm_count=sm_count,
         device=device_idx,
         topk=topk,
-        split_mode=split_mode or (
+        split_mode=(
             _split_mode(
                 num_q_heads // num_kv_heads,
                 batch_size * q_len_per_req * num_kv_heads,
@@ -372,7 +367,6 @@ def plan_decode(
     num_kv_splits: int | None = None,
     usable_sm_count: int | None = None,
     block_scale_shift: int = 0,
-    split_mode: str | None = None,
 ) -> DecodePlan:
     """Build the reusable schedule outside CUDA Graph capture.
 
@@ -386,7 +380,7 @@ def plan_decode(
     factor back into the scores and the output. Use 0 when ``code * scale`` already fits E4M3
     (products up to 448) and 3 when block scales use the full E4M3 range with a global scale
     (products up to 6 * 448, the vLLM / TransformerEngine convention). Each value is a separate
-    compiled kernel. ``split_mode`` ("legacy" or "streamk") overrides the automatic schedule.
+    compiled kernel.
     """
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("plan_decode() must be called outside CUDA Graph capture")
@@ -416,7 +410,6 @@ def plan_decode(
         topk=topk,
         num_kv_splits=num_kv_splits,
         usable_sm_count=usable_sm_count,
-        split_mode=split_mode,
     )
     return DecodePlan(
         backend_plan=backend_plan,

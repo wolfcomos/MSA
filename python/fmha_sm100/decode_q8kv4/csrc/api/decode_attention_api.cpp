@@ -21,10 +21,8 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <mutex>
 #include <numeric>
 #include <stdexcept>
-#include <unordered_map>
 
 namespace fmha_sm100::decode_q8kv4 {
 
@@ -99,17 +97,6 @@ static tvm::ffi::Tensor tensor_or_null(const at::Tensor &t) {
 
 static at::Tensor allocate_plan_buffer(int64_t size, int device, at::ScalarType dtype) {
   return torch::empty({size}, torch::TensorOptions().dtype(dtype).device(torch::kCUDA, device));
-}
-
-// One CUTLASS workspace per device, shared by every plan (the kernel's get_workspace_size is 0).
-static at::Tensor shared_cute_workspace(int device) {
-  static std::mutex mutex;
-  static auto *buffers = new std::unordered_map<int, at::Tensor>();  // leaked: no teardown-order hazard
-  std::lock_guard<std::mutex> lock(mutex);
-  auto it = buffers->find(device);
-  if (it == buffers->end())
-    it = buffers->emplace(device, allocate_plan_buffer(32 * 1024 * 1024, device, torch::kUInt8)).first;
-  return it->second;
 }
 
 template <typename T>
@@ -414,7 +401,7 @@ PlanInfo _make_decode_plan_impl(at::Tensor qo_segment_lens, at::Tensor kv_segmen
 
   PlanInfo info;
 
-  auto cute_workspace = shared_cute_workspace(device);
+  auto cute_workspace = allocate_plan_buffer(32 * 1024 * 1024, device, torch::kUInt8);
 
   int num_ctas = get_num_cta(device);
   if (usable_SM_count > 0)

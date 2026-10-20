@@ -41,7 +41,7 @@ def _head_slot_views(storage, page_size=128, world_size=2):
     return nvfp4_head_slot_views(slots[:, 0::2], slots[:, 1::2])
 
 
-def _nvfp4_prefill(device, page_size=128, world_size=2):
+def _nvfp4_prefill(device, page_size=128, world_size=2, query_dtype="bf16"):
     """One serving-form prefill (CSR schedule, caller-owned out): k2q builder + CuTe AOT."""
     import torch
 
@@ -67,7 +67,9 @@ def _nvfp4_prefill(device, page_size=128, world_size=2):
             q2k[row + t, :, :pick.numel()] = pick.to(torch.int32)
         row += q_len
     heads = heads_kv * _GQA
-    q = torch.randn((sum(q_lens), heads, _HEAD_DIM), generator=g, device="cpu").to(torch.bfloat16)
+    dtype = torch.bfloat16 if query_dtype == "bf16" else torch.float8_e4m3fn
+    q = torch.randn((sum(q_lens), heads, _HEAD_DIM), generator=g, device="cpu").to(dtype)
+    q_scale = 0.75 if query_dtype == "fp8" else 1.0
     _, compound_bytes = _page_bytes(page_size, world_size)
     storage = torch.randint(0, 256, (sum(pages) + 3, compound_bytes), generator=g,
                             device="cpu", dtype=torch.uint8)
@@ -91,11 +93,12 @@ def _nvfp4_prefill(device, page_size=128, world_size=2):
             q, k, v, k_sf, v_sf,
             torch.tensor([0.75], dtype=torch.float32, device=device),
             torch.tensor([1.25], dtype=torch.float32, device=device),
-            rowptr, qidx, topK=_TOPK, blk_kv=_BLK, causal=True, softmax_scale=_HEAD_DIM ** -0.5,
+            rowptr, qidx, topK=_TOPK, blk_kv=_BLK, causal=True,
+            softmax_scale=_HEAD_DIM ** -0.5 * q_scale,
             cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=max(q_lens),
             max_seqlen_k=max(k_lens), page_table=table,
             seqused_k=torch.tensor(k_lens, dtype=torch.int32, device=device), schedule=schedule,
-            out=torch.empty_like(q), kv_layout="vllm")
+            out=torch.empty(q.shape, dtype=torch.bfloat16, device=device), kv_layout="vllm")
     torch.cuda.synchronize(device)
 
 
@@ -135,7 +138,9 @@ def _main_attention_artifacts(device, page_size=128, world_size=2) -> list[tuple
         *((f"q8kv4:forward[split_kv={split}]",
            partial(_call, "..decode_q8kv4.jit", "get_fmha_fwd_variant", split_kv=split, **q8))
           for split in (False, True)),
-        ("nvfp4:prefill", partial(_nvfp4_prefill, device, page_size, world_size)),
+        *((f"nvfp4:prefill[{dtype}]",
+           partial(_nvfp4_prefill, device, page_size, world_size, dtype))
+          for dtype in ("bf16", "fp8")),
     ]
 
 

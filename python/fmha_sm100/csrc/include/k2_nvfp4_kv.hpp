@@ -56,6 +56,7 @@ struct Nvfp4KvViews {
   const uint8_t* v_data  = nullptr;
   const uint8_t* v_scale = nullptr;
   int64_t page_stride  = 0;                       // bytes between consecutive PHYSICAL pages
+  int blocks_per_page = 1;
   int head_stride_data  = 8192;               // bytes between kv heads, data region
   int head_stride_scale = 1024;               // bytes between kv heads, scale region
 

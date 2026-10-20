@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import os
 import sys
 from functools import partial
@@ -16,17 +15,13 @@ from functools import partial
 from . import _build
 
 
-# Production config: four global KV heads, D128, GQA16, top-16 B128, FP8 scale shift 3.
-_HEAD_DIM, _GQA, _TOPK, _BLK, _SCALE_SHIFT = 128, 16, 16, 128, 3
+# Production config: four global KV heads, D128, GQA16, top-16 B128.
+_HEAD_DIM, _GQA, _TOPK, _BLK = 128, 16, 16, 128
 
 
 def _page_bytes(page_size, world_size=2):
     slot_bytes = page_size * (_HEAD_DIM // 2 + _HEAD_DIM // 16)
     return slot_bytes, 2 * (4 // world_size) * slot_bytes + (page_size // world_size) * _HEAD_DIM
-
-
-def _call(module: str, attr: str, *args, **kwargs):
-    return getattr(importlib.import_module(module, __package__), attr)(*args, **kwargs)
 
 
 def _head_slot_views(storage, page_size=128, world_size=2):
@@ -83,22 +78,16 @@ def _nvfp4_prefill(device, page_size=128, world_size=2, query_dtype="bf16"):
         q2k.transpose(0, 1), cu_q, cu_k, _BLK, total_k=0, max_seqlen_k=max(k_lens),
         max_seqlen_q=max(q_lens), total_rows=sum(-(-k // _BLK) for k in k_lens), qhead_per_kv=_GQA,
         return_schedule=True)
-    # Decode's DLPack bridge normalizes the singleton head stride in place.
-    # Warm both metadata signatures; the addresses are identical for Hkv=1.
-    for normalize_head_stride in ((False, True) if heads_kv == 1 else (False,)):
-        if normalize_head_stride:
-            k = k.as_strided(k.shape, (k.stride(0), page_size * 64, 64, 1))
-            v = v.as_strided(v.shape, (v.stride(0), page_size * 64, 64, 1))
-        sparse_atten_nvfp4_kv_func(
-            q, k, v, k_sf, v_sf,
-            torch.tensor([0.75], dtype=torch.float32, device=device),
-            torch.tensor([1.25], dtype=torch.float32, device=device),
-            rowptr, qidx, topK=_TOPK, blk_kv=_BLK, causal=True,
-            softmax_scale=_HEAD_DIM ** -0.5 * q_scale,
-            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=max(q_lens),
-            max_seqlen_k=max(k_lens), page_table=table,
-            seqused_k=torch.tensor(k_lens, dtype=torch.int32, device=device), schedule=schedule,
-            out=torch.empty(q.shape, dtype=torch.bfloat16, device=device), kv_layout="vllm")
+    sparse_atten_nvfp4_kv_func(
+        q, k, v, k_sf, v_sf,
+        torch.tensor([0.75], dtype=torch.float32, device=device),
+        torch.tensor([1.25], dtype=torch.float32, device=device),
+        rowptr, qidx, topK=_TOPK, blk_kv=_BLK, causal=True,
+        softmax_scale=_HEAD_DIM ** -0.5 * q_scale,
+        cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens), page_table=table,
+        seqused_k=torch.tensor(k_lens, dtype=torch.int32, device=device), schedule=schedule,
+        out=torch.empty(q.shape, dtype=torch.bfloat16, device=device), kv_layout="vllm")
     torch.cuda.synchronize(device)
 
 
@@ -131,13 +120,15 @@ def _artifacts(device, page_size=128, world_size=2) -> list[tuple[str, partial]]
 
 def _main_attention_artifacts(device, page_size=128, world_size=2) -> list[tuple[str, partial]]:
     """Optional compound-cache consumers; independent index caches do not need these."""
-    q8 = {"topk": _TOPK, "gqa_ratio": _GQA, "device": device, "block_scale_shift": _SCALE_SHIFT}
+    from ..msa_warmup import plan_warmup
+
+    items = plan_warmup(
+        "nvfp4", None, (4 // world_size) * _GQA, 4 // world_size, _TOPK,
+        decode_query_lens=range(1, 33), page_size=_BLK, decode_backend="kv_mode3",
+        sparse_prefill=False, device=device)
+    unique = {item.label: item.build for item in items}
     return [
-        ("q8kv4:cpp_ext", partial(_call, "..decode_q8kv4.interface", "_get_cpp")),
-        ("q8kv4:plan", partial(_call, "..decode_q8kv4.jit", "get_plan_fn", device=device)),
-        *((f"q8kv4:forward[split_kv={split}]",
-           partial(_call, "..decode_q8kv4.jit", "get_fmha_fwd_variant", split_kv=split, **q8))
-          for split in (False, True)),
+        *((f"nvfp4:decode:{label}", partial(build)) for label, build in unique.items()),
         *((f"nvfp4:prefill[{dtype}]",
            partial(_nvfp4_prefill, device, page_size, world_size, dtype))
           for dtype in ("bf16", "fp8")),

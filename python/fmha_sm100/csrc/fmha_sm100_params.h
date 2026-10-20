@@ -78,6 +78,7 @@ struct FMHACutlassSM100Params {
   void* nvfp4_v_data_ptr = nullptr;
   void* nvfp4_v_scale_ptr = nullptr;
   int64_t nvfp4_page_stride = 0;         // bytes between consecutive PHYSICAL pages
+  int nvfp4_page_size = 128;
   int nvfp4_head_stride_data = 8192; // bytes between kv heads, data region
   int nvfp4_head_stride_scale = 1024;// bytes between kv heads, scale region
   float dequant_g_k = 1.0f;

@@ -265,6 +265,7 @@ def test_main_attention_prewarm_is_separate():
     from fmha_sm100.icp import prewarm
 
     labels = [label for label, _ in prewarm._main_attention_artifacts(None, 256, 4)]
-    assert len(labels) == 6
     assert labels[-2:] == ["nvfp4:prefill[bf16]", "nvfp4:prefill[fp8]"]
-    assert all(label.startswith(("q8kv4:", "nvfp4:")) for label in labels)
+    assert all(label.startswith("nvfp4:decode:") for label in labels[:-2])
+    assert any("split-KV reduction" in label for label in labels)
+    assert any("nvfp4_v1" in label for label in labels)

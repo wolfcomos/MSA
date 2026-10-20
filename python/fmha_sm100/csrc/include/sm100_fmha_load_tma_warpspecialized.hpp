@@ -164,12 +164,12 @@ struct Sm100FmhaLoadTmaWarpspecialized {
   template <bool kIsV, class ParamsT, class TensorStorageType, class BarrierT>
   CUTLASS_DEVICE static void k2_bulk_load_stage(ParamsT const& params,
                                                 TensorStorageType& storage, BarrierT* mbar,
-                                                int stage, int page, int head) {
+                                                int stage, int page, int head, int block) {
     static_assert(k2::kStageBytes == 8192 + 1024, "mode 3 staging stage must be 9216 B");
     uint8_t* dst = storage.smem_kv_stage.data() + (size_t)stage * k2::kStageBytes;
     uint64_t* mb = reinterpret_cast<uint64_t*>(mbar);
-    cute::SM90_BULK_COPY_G2S::copy(params.nvfp4_kv.data(kIsV, page, head), mb, dst, 8192);
-    cute::SM90_BULK_COPY_G2S::copy(params.nvfp4_kv.scale(kIsV, page, head), mb, dst + 8192, 1024);
+    cute::SM90_BULK_COPY_G2S::copy(params.nvfp4_kv.data(kIsV, page, head) + block * 8192, mb, dst, 8192);
+    cute::SM90_BULK_COPY_G2S::copy(params.nvfp4_kv.scale(kIsV, page, head) + block * 1024, mb, dst + 8192, 1024);
   }
 #endif
 
@@ -650,6 +650,9 @@ struct Sm100FmhaLoadTmaWarpspecialized {
       if constexpr (kSparseAttnMode != SparseAttnMode::Sparse && !kNeedIcp) {
         int kv_page_end = KV_INDPTR_LOAD(params.kv_page_indptr, batch_idx + 1, params.kv_page_indptr_size);
         num_pages_batch = kv_page_end - kv_page_start;
+#if MSA_NVFP4_KV_MODE >= 3
+        num_pages_batch *= params.nvfp4_kv.blocks_per_page;
+#endif
       }
       constexpr int effective_tile_kv = get<1>(TileShapeQK{});
       static_assert(KVPageSize >= effective_tile_kv && KVPageSize % effective_tile_kv == 0,
@@ -687,6 +690,10 @@ struct Sm100FmhaLoadTmaWarpspecialized {
           page_for_lookup = logical_page;
           page_for_lookup = min(page_for_lookup, num_pages_batch - 1);
         }
+#if MSA_NVFP4_KV_MODE >= 3
+        int block_in_page = page_for_lookup % params.nvfp4_kv.blocks_per_page;
+        page_for_lookup /= params.nvfp4_kv.blocks_per_page;
+#endif
         int physical_page = KV_INDICES_LOAD(params.kv_indices, kv_page_start + page_for_lookup, params.kv_indices_size);
         { GPU_TRACE_SCOPE(LOAD_K); pipeline_kv.producer_acquire(pipeline_kv_producer_state); }
         if (lane_predicate) {
@@ -695,7 +702,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
 #if MSA_NVFP4_KV_MODE >= 3
           k2_bulk_load_stage</*kIsV=*/false>(params, storage, tma_barrier,
                                              pipeline_kv_producer_state.index(),
-                                             physical_page, kv_head_idx);
+                                             physical_page, kv_head_idx, block_in_page);
 #else
           copy(params.tma_load_K.with(*tma_barrier, 0),
                tKgK(_, sub_tile, kv_head_idx, physical_page),
@@ -718,6 +725,10 @@ struct Sm100FmhaLoadTmaWarpspecialized {
           page_for_lookup = logical_page;
           page_for_lookup = min(page_for_lookup, num_pages_batch - 1);
         }
+#if MSA_NVFP4_KV_MODE >= 3
+        int block_in_page = page_for_lookup % params.nvfp4_kv.blocks_per_page;
+        page_for_lookup /= params.nvfp4_kv.blocks_per_page;
+#endif
         int physical_page = KV_INDICES_LOAD(params.kv_indices, kv_page_start + page_for_lookup, params.kv_indices_size);
         { GPU_TRACE_SCOPE(LOAD_V); pipeline_kv.producer_acquire(pipeline_kv_producer_state); }
         if (lane_predicate) {
@@ -726,7 +737,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
 #if MSA_NVFP4_KV_MODE >= 3
           k2_bulk_load_stage</*kIsV=*/true>(params, storage, tma_barrier,
                                             pipeline_kv_producer_state.index(),
-                                            physical_page, kv_head_idx);
+                                            physical_page, kv_head_idx, block_in_page);
 #else
           if constexpr (LoadV) {
             copy(params.tma_load_V.with(*tma_barrier, 0),

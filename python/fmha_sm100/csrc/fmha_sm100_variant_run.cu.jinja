@@ -253,6 +253,7 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
   params.nvfp4_v_data_ptr  = nvfp4_u8_ptr(maybe_nvfp4_v_data,  "nvfp4_v_data");
   params.nvfp4_v_scale_ptr = nvfp4_u8_ptr(maybe_nvfp4_v_scale, "nvfp4_v_scale");
   params.nvfp4_page_stride       = nvfp4_page_stride;
+  params.nvfp4_page_size         = page_size;
   params.nvfp4_head_stride_data  = static_cast<int>(nvfp4_head_stride_data);
   params.nvfp4_head_stride_scale = static_cast<int>(nvfp4_head_stride_scale);
   params.dequant_g_k = static_cast<float>(dequant_g_k);
@@ -265,6 +266,8 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
       << "MSA_NVFP4_KV_MODE=3 variant {{ variant_name }} requires all four NVFP4 KV views";
   TVM_FFI_ICHECK(params.nvfp4_page_stride > 0)
       << "MSA_NVFP4_KV_MODE=3 requires a positive nvfp4_page_stride";
+  TVM_FFI_ICHECK(page_size == 128 || page_size == 256)
+      << "NVFP4 physical pages must contain 128 or 256 tokens";
   TVM_FFI_ICHECK(params.dequant_g_k > 0.0f && params.dequant_g_v > 0.0f)
       << "dequant_g_k / dequant_g_v must be positive; got "
       << params.dequant_g_k << " / " << params.dequant_g_v;

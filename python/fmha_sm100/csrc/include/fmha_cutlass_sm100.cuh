@@ -154,6 +154,7 @@ struct FwdRunner {
                          float dequant_g_v = 1.0f,
                          const float* nvfp4_k_global_scale = nullptr,
                          const float* nvfp4_v_global_scale = nullptr,
+                         int nvfp4_page_size = 128,
                          cutlass::fmha::collective::IcpParams icp = {}) {
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
@@ -177,6 +178,7 @@ struct FwdRunner {
       arguments.mainloop.load.nvfp4_kv.v_data            = nvfp4_v_data;
       arguments.mainloop.load.nvfp4_kv.v_scale           = nvfp4_v_scale;
       arguments.mainloop.load.nvfp4_kv.page_stride       = nvfp4_page_stride;
+      arguments.mainloop.load.nvfp4_kv.blocks_per_page   = nvfp4_page_size / 128;
       arguments.mainloop.load.nvfp4_kv.head_stride_data  = nvfp4_head_stride_data;
       arguments.mainloop.load.nvfp4_kv.head_stride_scale = nvfp4_head_stride_scale;
       arguments.mainloop.dequant_g_k = dequant_g_k;
@@ -519,6 +521,7 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                          float dequant_g_v = 1.0f,
                          const float* nvfp4_k_global_scale = nullptr,
                          const float* nvfp4_v_global_scale = nullptr,
+                         int nvfp4_page_size = 128,
                          cutlass::fmha::collective::IcpParams icp = {}) {
   return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask,
                    ThreadShape, IsSplitKV, SingleSoftmaxWarpGroup, KVPageSize, kSparseAttnMode>::run(
@@ -539,7 +542,8 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
       pack_gqa, num_ctas,
       nvfp4_k_data, nvfp4_k_scale, nvfp4_v_data, nvfp4_v_scale,
       nvfp4_page_stride, nvfp4_head_stride_data, nvfp4_head_stride_scale,
-      dequant_g_k, dequant_g_v, nvfp4_k_global_scale, nvfp4_v_global_scale, icp);
+      dequant_g_k, dequant_g_v, nvfp4_k_global_scale, nvfp4_v_global_scale,
+      nvfp4_page_size, icp);
 }
 
 };  // namespace flashinfer

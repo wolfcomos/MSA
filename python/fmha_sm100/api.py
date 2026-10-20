@@ -953,6 +953,8 @@ def _fmha_sm100(
     _nv_g_k = 1.0
     if is_nvfp4:
         _kv_dtype = "nvfp4"
+        # Sparse block IDs and arithmetic tiles remain B128 for either physical page size.
+        variant_page_size = 128
         _nv_g_k = 6.0
         nvfp4_args = (
             k, k_sf, v, v_sf,

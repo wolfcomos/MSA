@@ -307,12 +307,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         : ( (get<0>(ThreadShape{}) == 1) ? 4 : 2 );
       // (StageCountKV_dynamic > StageCountKV_base) ? StageCountKV_dynamic : StageCountKV_base;
 
-  // The OnlyScoreIcp prefill scorer (IcpPrefillMask) runs a 16-deep K ring.
+  // The OnlyScoreIcp prefill scorer sizes its K ring for the rank fragment.
   static constexpr int StageCountKV_prefill = kv_stage_count_of<Mask_>::value
       ? kv_stage_count_of<Mask_>::value : StageCountKV_shipped;
   static_assert(kv_stage_count_of<Mask_>::value == 0 ||
                 (kNeedIcp && !IsSplitKV && sizeof(Element_) == 1
-                 && (KVPageSize == 32 || KVPageSize == 64)
+                 && (KVPageSize == 32 || KVPageSize == 64 || KVPageSize == 128)
                  && get<0>(ThreadShape{}) == 1 && get<1>(ThreadShape{}) == 2),
                 "the deep K ring is restricted to the OnlyScoreIcp FP8 prefill scorer");
 
@@ -1414,9 +1414,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       const int p = row + qo_offset;
       int n_eff = min(p + 1, kv_len);
       if (n_eff < 0) n_eff = 0;
-      int rem = n_eff % 128 - icp_r * kRfrag;
+      const int physical_page = kRfrag * icp_c_of(params.load.kv_block_num);
+      int rem = n_eff % physical_page - icp_r * kRfrag;
       rem = max(0, min(rem, kRfrag));
-      const int l_r = (n_eff / 128) * kRfrag + rem;
+      const int l_r = (n_eff / physical_page) * kRfrag + rem;
       const int n_valid = (l_r + kRfrag - 1) / kRfrag;
 
       int k = 4 * lane;
@@ -1838,10 +1839,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         const int icp_p = icp_abs_row + Mask::get_qo_offset(problem_shape);
         int n_eff = (icp_p + 1) < icp_kv_len ? (icp_p + 1) : icp_kv_len;
         if (n_eff < 0) n_eff = 0;
-        int rem = n_eff % 128 - icp_r * kRfrag;
+        const int physical_page = kRfrag * icp_c_of(params.load.kv_block_num);
+        int rem = n_eff % physical_page - icp_r * kRfrag;
         if (rem < 0) rem = 0;
         if (rem > kRfrag) rem = kRfrag;
-        const int l_r = (n_eff / 128) * kRfrag + rem;
+        const int l_r = (n_eff / physical_page) * kRfrag + rem;
         const int n_valid = (l_r + kRfrag - 1) / kRfrag;
         const int pwave = params.load.icp.max_k_tiles;
         // Vector stores need unit K stride and aligned row bases.

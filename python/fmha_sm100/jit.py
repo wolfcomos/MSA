@@ -119,7 +119,7 @@ _FMHA_SM100_IMPOSSIBLE = lambda p: (
     (p.get("pack_factor", 1) > 1 and p.get("tile_q") == "_256") or
     (p.get("page_size") in (32, 64) and p.get("sparse_mode") != "OnlyScoreIcp") or
     (p.get("sparse_mode") == "OnlyScoreIcp" and (
-        p.get("page_size") not in (32, 64) or
+        p.get("page_size") not in (32, 64, 128) or
         p.get("dtype_in") != "__nv_fp8_e4m3" or p.get("tile_q") != "_128" or
         p.get("is_split_kv") == "true" or p.get("pack_factor", 1) != 1 or
         p.get("kv_mode", 0) != 0)) or

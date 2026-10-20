@@ -187,26 +187,27 @@ def test_p128_prefill_candidates_keep_global_block_ids(make, world_size):
 
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_other_physical_page_sizes_are_rejected(make, world_size):
-    with pytest.raises(ValueError, match="128-token index pages"):
-        make(page_size=256, world_size=world_size)
+    with pytest.raises(ValueError, match="P128/P256 index pages"):
+        make(page_size=512, world_size=world_size)
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_prewarm_contains_only_indexer_artifacts(monkeypatch, world_size):
+@pytest.mark.parametrize("page_size", [128, 256])
+def test_prewarm_contains_only_indexer_artifacts(monkeypatch, world_size, page_size):
     from fmha_sm100.icp import prewarm
 
     monkeypatch.setattr(prewarm._build, "arch", lambda: "103a")
-    artifacts = prewarm._artifacts(None, world_size=world_size)
+    artifacts = prewarm._artifacts(None, page_size=page_size, world_size=world_size)
     assert len(artifacts) == len(prewarm._build.EXTENSIONS) + 2 + 4 * world_size
     labels = [name for name, _ in artifacts]
     assert len(set(labels)) == len(labels)
     assert all(name.startswith(("icp:", "fmha:OnlyScoreIcp", "decode:")) for name in labels)
     for q in range(1, 5):
         for rank in range(world_size):
-            assert "decode:" + icp_decode_score._aot_function_name(q, rank, 128, world_size) in labels
+            assert "decode:" + icp_decode_score._aot_function_name(q, rank, page_size, world_size) in labels
 
 
-@pytest.mark.parametrize("fragment", [32, 64])
+@pytest.mark.parametrize("fragment", [32, 64, 128])
 def test_prefill_tiles_fit_rank_pages(fragment):
     from fmha_sm100 import jit
 
@@ -215,3 +216,54 @@ def test_prefill_tiles_fit_rank_pages(fragment):
         stage_columns = int(params["tile_kv"].removeprefix("_")) // 2
         assert stage_columns == fragment
         assert not jit._FMHA_SM100_IMPOSSIBLE(params)
+
+
+@pytest.mark.parametrize("world_size,rank", [(w, r) for w in (2, 4) for r in range(w)])
+def test_p256_columns_map_to_global_b128_ids(make, world_size, rank):
+    indexer, calls = make(page_size=256, world_size=world_size, rank=rank)
+    begin = rank * (256 // world_size) // 128
+    assert indexer._max_blocks == NB // 2
+    assert indexer._fragment == 256 // world_size
+    table = torch.zeros(64, NB, dtype=torch.int32)
+    step = _plan(indexer, [1, 2, 1], [300, 129, 5], [False] * 3, table=table)
+    _select(indexer, step)
+    (_, key, args), = calls
+    assert key == api._icp_scorer_variants(256 // world_size)[0][1]
+    assert args[2].shape == (10, 1, 256 // world_size, 128)
+    assert args[28].shape == (4, 4, NB // 2)
+    assert indexer._exchange.geometry == [(begin, 2)]
+    calls.clear()
+    step = _plan(indexer, [100, 1], [100, 1000], [True, False], table=table)
+    _select(indexer, step)
+    _, select = calls
+    assert select[2] == (begin, False)
+    assert select[3] == {"global_block_stride": 2}
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("page_size", [128, 256])
+def test_compound_main_views_alias_payload_and_scales(page_size, world_size):
+    from fmha_sm100.icp.prewarm import _head_slot_views, _page_bytes
+
+    slot, pitch = _page_bytes(page_size, world_size)
+    storage = torch.randint(0, 256, (3, pitch), dtype=torch.uint8,
+                            generator=torch.Generator().manual_seed(7))
+    kd, ks, vd, vs = _head_slot_views(storage, page_size, world_size)
+    heads = 4 // world_size
+    for view, base, width in ((kd, 0, 64), (ks, page_size * 64, 8),
+                               (vd, slot, 64), (vs, slot + page_size * 64, 8)):
+        assert view.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
+        assert view.shape == (3, heads, page_size, width)
+        for page in range(3):
+            for head in range(heads):
+                offset = head * 2 * slot + base
+                expected = storage[page, offset:offset + page_size * width].view(page_size, width)
+                assert torch.equal(view[page, head], expected)
+
+
+def test_main_attention_prewarm_is_separate():
+    from fmha_sm100.icp import prewarm
+
+    labels = [label for label, _ in prewarm._main_attention_artifacts(None, 256, 4)]
+    assert len(labels) == 5
+    assert all(label.startswith(("q8kv4:", "nvfp4:")) for label in labels)

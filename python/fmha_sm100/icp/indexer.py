@@ -14,7 +14,7 @@ from . import _build
 from .exchange import _SLOTS, _Exchange
 from .scorer.decode import icp_decode_score
 
-# Logical index pages and sparse ranking blocks both cover 128 tokens.
+# Sparse ranking blocks stay B128 with P128 or P256 physical pages.
 _PAGE = 128
 # Inner MSA tile; the planner pins it to 128 whenever icp_c > 1.
 _QO_TILE = 128
@@ -99,12 +99,14 @@ class IcpIndexer:
             raise ValueError(f"ICP: {num_sparse_layers} sparse layers repeat a D3 slot "
                              f"across the wrap of {_SLOTS} slots")
         self._world = dist.get_world_size(group)
-        if self._world not in (2, 4) or page_size != _PAGE:
-            raise ValueError("ICP requires TP2/TP4 and 128-token index pages")
+        if self._world not in (2, 4) or page_size not in (128, 256):
+            raise ValueError("ICP requires TP2/TP4 and P128/P256 index pages")
         if rank != dist.get_rank(group):
             raise ValueError("ICP rank must be the rank within its process group")
         self._page_size = page_size
         self._fragment = page_size // self._world
+        self._block_begin = rank * self._fragment // _PAGE
+        self._block_stride = page_size // _PAGE
         self._rank, self._topk, self._head_dim = rank, topk_buffer, index_head_dim
         self._hl = topk_buffer.shape[1]
         self._hg = self._world * self._hl
@@ -372,17 +374,17 @@ class IcpIndexer:
                 self._forced_column[begin : begin + rows], self._active[begin : begin + rows])
 
         def publish(layer: int) -> None:
-            self._exchange.publish(*args, layer=layer, token_offset=begin)
+            self._exchange.publish(*args, layer=layer, token_offset=begin,
+                                   block_begin=self._block_begin, block_stride=self._block_stride)
 
         return publish
 
     def _select_prefill(self, scores, begin: int, rows: int) -> Callable[[int], None]:
         end = begin + rows
         args = (scores, self._nvalid[begin:end], self._forced_column[begin:end],
-                self._active[begin:end], self._candidates[begin:end], 0, False)
+                self._active[begin:end], self._candidates[begin:end], self._block_begin, False)
 
         def select(layer: int) -> None:
-            # Unit stride from block 0, no PDL: prefill is eager, never captured.
-            self._select.select_prefill_candidates(*args, global_block_stride=1)
+            self._select.select_prefill_candidates(*args, global_block_stride=self._block_stride)
 
         return select

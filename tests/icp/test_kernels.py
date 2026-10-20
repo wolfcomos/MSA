@@ -61,14 +61,14 @@ def test_prefill_selector_every_kernel_width(cuda_device, columns):
     assert torch.equal(out.cpu(), expected)
 
 
-def _requests(query_lens, histories, rank, seed, world_size, padded):
+def _requests(query_lens, histories, rank, seed, world_size, padded, page_size=128):
     """Shared logical FP8 keys, contiguous rank fragments and an independent causal oracle."""
-    frag = PAGE // world_size
+    frag = page_size // world_size
     g = torch.Generator().manual_seed(seed)
     seqs = [h + q for q, h in zip(query_lens, histories)]
-    blocks = [-(-s // PAGE) for s in seqs]
+    blocks = [-(-s // page_size) for s in seqs]
     cols, pages = max(blocks), sum(blocks) + 3
-    keys = (torch.randn(pages, PAGE, DIM, generator=g) * 0.7).to(torch.float8_e4m3fn)
+    keys = (torch.randn(pages, page_size, DIM, generator=g) * 0.7).to(torch.float8_e4m3fn)
     perm = torch.randperm(pages, generator=g).int()
     table = torch.full((len(seqs), cols + 2), -(1 << 30), dtype=torch.int32)
     q = (torch.randn(sum(query_lens), HEADS, DIM, generator=g) * 0.7).to(torch.float8_e4m3fn)
@@ -80,7 +80,7 @@ def _requests(query_lens, histories, rank, seed, world_size, padded):
         table[b, :count] = perm[page_start:page_start + count]
         local = keys[table[b, :count].long(), rank * frag:(rank + 1) * frag].float()
         dots = torch.einsum("thd,cpd->thcp", q[row_start:row_start + n].float(), local)
-        key_pos = torch.arange(count)[:, None] * PAGE + rank * frag + torch.arange(frag)
+        key_pos = torch.arange(count)[:, None] * page_size + rank * frag + torch.arange(frag)
         visible = (key_pos[None] <= pos[row_start:row_start + n, None, None]) & (key_pos[None] < length)
         score[row_start:row_start + n, :, :count] = torch.where(visible[:, None], dots, -math.inf).amax(-1)
         valid[row_start:row_start + n, :, :count] = visible.any(-1)[:, None]
@@ -88,13 +88,13 @@ def _requests(query_lens, histories, rank, seed, world_size, padded):
         page_start += count
     pitch = frag * DIM + (256 if padded else 0)
     storage = torch.full((pages * pitch,), 0x7F, dtype=torch.uint8)
-    _, local = _fragment_view(storage, "cpu", world_size, padded)
+    _, local = _fragment_view(storage, "cpu", world_size, padded, page_size)
     local.copy_(keys[:, rank * frag:(rank + 1) * frag])
     return q, storage, table, pos, seqs, score, valid
 
 
-def _fragment_view(storage, device, world_size, padded):
-    frag = PAGE // world_size
+def _fragment_view(storage, device, world_size, padded, page_size=128):
+    frag = page_size // world_size
     pitch, offset = frag * DIM + (256 if padded else 0), 128 if padded else 0
     storage = storage.to(device)
     return storage, storage.view(torch.float8_e4m3fn).as_strided(
@@ -126,14 +126,15 @@ def _write_device_plan(store, query_lens, seqs):
     store.work[0, ctas:ctas + len(info)] = torch.tensor(info)
 
 
+@pytest.mark.parametrize("page_size", [128, 256])
 @pytest.mark.parametrize("world_size,rank", PROFILES)
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("query_lens,histories", [
     ([300, 64, 65, 1, 129], [1000, 0, 0, 5000, 200]),  # mixed; rank 1 has no Q64 fragment
     ([1, 2, 3, 1, 1, 1], [70000, 129, 31, 63, 95, 0]),  # non-uniform decode: the single-warpgroup variant
 ])
-def test_onlyscoreicp_on_a_writer_model_device_plan(cuda_device, world_size, rank, padded, query_lens, histories):
-    q, storage, table, _, seqs, score_ref, valid_ref = _requests(query_lens, histories, rank, 7, world_size, padded)
+def test_onlyscoreicp_on_a_writer_model_device_plan(cuda_device, world_size, rank, padded, query_lens, histories, page_size):
+    q, storage, table, _, seqs, score_ref, valid_ref = _requests(query_lens, histories, rank, 7, world_size, padded, page_size)
     cols, dev = score_ref.shape[-1], cuda_device
     store = api._IcpDevicePlanStore(device=dev, num_slots=1, max_segments=len(seqs),
                                     num_heads=HEADS, max_chunk_tokens=q.shape[0])
@@ -143,8 +144,8 @@ def test_onlyscoreicp_on_a_writer_model_device_plan(cuda_device, world_size, ran
         torch.tensor(query_lens, dtype=torch.int32), HEADS, icp_rank=rank, block_table=table,
         block_table_row_stride=table.stride(0), block_table_row_begin=0,
         device_plan=store.slot(0), max_k_tiles=cols,
-        page_size=PAGE // world_size, world_size=world_size)
-    _storage, keys = _fragment_view(storage, dev, world_size, padded)
+        page_size=page_size // world_size, world_size=world_size)
+    _storage, keys = _fragment_view(storage, dev, world_size, padded, page_size)
     score = torch.full((q.shape[0], HEADS, cols + 3), math.nan, device=dev)
     valid = torch.full_like(score, 201, dtype=torch.uint8)
     api._fmha_sm100_icp(q.to(dev), keys.unsqueeze(1), plan, max_score=score[..., :cols],
@@ -163,32 +164,33 @@ def decode_scan(cuda_device):
     # The export targets the device arch; the DSL reads it at first import.
     os.environ.setdefault("CUTE_DSL_ARCH", f"sm_{arch[0]}{arch[1]}a")
 
-    def get(query_len, rank, world_size):
-        if not scorer._aot_path(query_len, rank, arch, PAGE, world_size).is_file():
-            scorer._export_aot_scan(query_len, rank, arch, PAGE, world_size)
-        return scorer._compile_scan(query_len, rank, cuda_device.index, arch, PAGE, world_size)
+    def get(query_len, rank, world_size, page_size):
+        if not scorer._aot_path(query_len, rank, arch, page_size, world_size).is_file():
+            scorer._export_aot_scan(query_len, rank, arch, page_size, world_size)
+        return scorer._compile_scan(query_len, rank, cuda_device.index, arch, page_size, world_size)
 
     return get
 
 
+@pytest.mark.parametrize("page_size", [128, 256])
 @pytest.mark.parametrize("world_size,rank", PROFILES)
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("query_len", [1, 2, 3, 4])
-def test_cute_decode_scan_matches_torch(cuda_device, decode_scan, query_len, world_size, rank, padded):
-    seqs = [1, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129, 385, 4000]
+def test_cute_decode_scan_matches_torch(cuda_device, decode_scan, query_len, world_size, rank, padded, page_size):
+    seqs = [1, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129, 191, 192, 193, 255, 256, 257, 4000]
     query_lens = [query_len] * len(seqs)
     histories = [max(0, s - query_len) for s in seqs]
     seqs = [h + query_len for h in histories]
-    q, storage, table, pos, _, score_ref, valid_ref = _requests(query_lens, histories, rank, 3, world_size, padded)
+    q, storage, table, pos, _, score_ref, valid_ref = _requests(query_lens, histories, rank, 3, world_size, padded, page_size)
     dev, tokens, cols = cuda_device, q.shape[0], score_ref.shape[-1]
-    _storage, keys = _fragment_view(storage, dev, world_size, padded)
+    _storage, keys = _fragment_view(storage, dev, world_size, padded, page_size)
     qsl = torch.arange(0, tokens + 1, query_len, dtype=torch.int32, device=dev)
     active = torch.ones(tokens, dtype=torch.uint8, device=dev)
     active[-1] = 0  # an inactive row: undefined output, never read
     q, table, pos = q.to(dev), table.to(dev), pos.to(dev)
     seqs_device = torch.tensor(seqs, dtype=torch.int32, device=dev)
     split = (len(seqs) // 2) * query_len
-    scan = decode_scan(query_len, rank, world_size)
+    scan = decode_scan(query_len, rank, world_size, page_size)
     for t0, t1 in ((0, split), (split, tokens)):
         score = torch.full((t1 - t0, HEADS, cols), math.nan, device=dev)
         valid = torch.zeros_like(score, dtype=torch.uint8)
@@ -213,17 +215,18 @@ def test_cute_decode_scan_matches_torch(cuda_device, decode_scan, query_len, wor
 
 
 @pytest.mark.distributed
+@pytest.mark.parametrize("page_size", [128, 256])
 @pytest.mark.parametrize("phase", ["decode", "nonuniform_decode", "prefill"])
-def test_indexer_pipeline_matches_global_dense_blocks(icp_group, cuda_device, phase):
+def test_indexer_pipeline_matches_global_dense_blocks(icp_group, cuda_device, phase, page_size):
     """Actual plan/select wiring; metadata is a CPU writer oracle, not the native writer."""
     import torch.distributed as dist
 
     from fmha_sm100.icp import IcpIndexer
 
     world_size = dist.get_world_size(icp_group)
-    fragment, heads_local = PAGE // world_size, HEADS // world_size
+    fragment, heads_local = page_size // world_size, HEADS // world_size
     rank, dev = dist.get_rank(icp_group), cuda_device
-    lengths = [4, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129, 4099]
+    lengths = [4, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129, 191, 192, 193, 255, 256, 257, 4099]
     query_lens = [4] * len(lengths)
     if phase == "nonuniform_decode":
         query_lens = [i % 4 + 1 for i in range(len(lengths))]
@@ -231,12 +234,12 @@ def test_indexer_pipeline_matches_global_dense_blocks(icp_group, cuda_device, ph
         query_lens = [65] + [1] * (len(lengths) - 2) + [4]
         lengths[0] = 65
     histories = [n - q for n, q in zip(lengths, query_lens)]
-    counts = [math.ceil(n / PAGE) for n in lengths]
+    counts = [math.ceil(n / page_size) for n in lengths]
     pages, rows, cap = sum(counts) + 3, sum(query_lens), 128
     gen = torch.Generator(device="cpu").manual_seed(142)
     # Small FP8 integers make QK exact in both FP16-MMA and FP32 references,
     # and deliberately exercise score ties with deterministic block-ID order.
-    all_keys = torch.randint(-3, 4, (pages, PAGE, DIM), generator=gen).to(torch.float8_e4m3fn)
+    all_keys = torch.randint(-3, 4, (pages, page_size, DIM), generator=gen).to(torch.float8_e4m3fn)
     query = torch.randint(-3, 4, (rows, 4, 128), generator=gen).to(torch.float8_e4m3fn)
     permutation = torch.randperm(pages, generator=gen).int()
     table = torch.full((len(lengths), max(counts) + 2), -(1 << 30), dtype=torch.int32)
@@ -253,7 +256,7 @@ def test_indexer_pipeline_matches_global_dense_blocks(icp_group, cuda_device, ph
             positions.append(position)
             forced = position // 128
             dots[t, :, position + 1:] = -math.inf
-            block_scores = dots[t].reshape(4, npage, PAGE).amax(-1)
+            block_scores = dots[t].reshape(4, npage * (page_size // PAGE), PAGE).amax(-1)
             for h in range(4):
                 best = sorted(range(forced), key=lambda block: (-float(block_scores[h, block]), block))[:15]
                 ids = sorted(best + [forced])
@@ -270,7 +273,7 @@ def test_indexer_pipeline_matches_global_dense_blocks(icp_group, cuda_device, ph
     indexer = IcpIndexer(group=icp_group, rank=rank, topk_buffer=out, num_sparse_layers=3,
                          index_head_dim=128, max_model_len=max(lengths),
                          max_num_batched_tokens=cap, max_num_seqs=len(lengths),
-                         cudagraph_capture_sizes=[4, 8, 16, 32, 64, 128], page_size=PAGE)
+                         cudagraph_capture_sizes=[4, 8, 16, 32, 64, 128], page_size=page_size)
     try:
         indexer.allocate(max_decode_query_len=4)
         step = indexer.plan(block_table=table, query_start_loc=qsl.to(dev),
@@ -280,8 +283,10 @@ def test_indexer_pipeline_matches_global_dense_blocks(icp_group, cuda_device, ph
                             num_reqs=len(lengths), num_tokens=rows)
         forced = (positions // 128).int()
         visible = positions + 1
-        local_count = (visible // PAGE + (visible % PAGE > rank * fragment)).int()
-        local_forced = torch.where(forced < local_count, forced, -1)
+        local_count = (visible // page_size + (visible % page_size > rank * fragment)).int()
+        block_stride, block_begin = page_size // PAGE, rank * fragment // PAGE
+        local_forced = torch.where((forced % block_stride == block_begin) &
+                                   (forced // block_stride < local_count), forced // block_stride, -1)
         for target, values in ((indexer._positions, positions), (indexer._nvalid, local_count),
                                (indexer._forced_column, local_forced), (indexer._forced, forced),
                                (indexer._global_nvalid, forced + 1),

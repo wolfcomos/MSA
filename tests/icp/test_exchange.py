@@ -87,15 +87,16 @@ def test_d3_and_nccl_routes_match_the_oracle(icp_group, cuda_device, tokens, col
         exchange.close()
 
 
-def _fragment_inputs(columns, seed):
-    """Independent B128 oracle for contiguous rank fragments of P128 pages."""
+def _fragment_inputs(columns, seed, page_size):
+    """Independent B128 oracle for contiguous rank fragments of P128/P256 pages."""
     g = torch.Generator().manual_seed(seed)
     visible = [0, 1, 31, 32, 33, 63, 64, 65, 95, 96, 97,
-               127, 128, 129, columns * 128 - 1, columns * 128]
-    tokens, hg, fragment = len(visible), WORLD * HL, 128 // WORLD
+               127, 128, 129, 191, 192, 193, 255, 256, 257,
+               columns * page_size - 1, columns * page_size]
+    tokens, hg, fragment = len(visible), WORLD * HL, page_size // WORLD
     scores = torch.randint(-5, 6, (WORLD, tokens, hg, columns), generator=g).float()
     active = torch.tensor([v > 0 for v in visible])
-    counts = torch.tensor([[v // 128 + (v % 128 > r * fragment) for v in visible]
+    counts = torch.tensor([[v // page_size + (v % page_size > r * fragment) for v in visible]
                            for r in range(WORLD)], dtype=torch.int32)
     forced = torch.tensor([(v - 1) // 128 if v else -1 for v in visible], dtype=torch.int32)
     forced_columns = torch.full_like(counts, -1)
@@ -104,14 +105,16 @@ def _fragment_inputs(columns, seed):
     for t, length in enumerate(visible):
         dense = torch.full((hg, (length + 127) // 128), -torch.inf)
         for r in range(WORLD):
+            block_stride, block_begin = page_size // 128, r * fragment // 128
             n = int(counts[r, t])
             scores[r, t, :, n:] = torch.nan
-            if 0 <= forced[t] < n:
-                forced_columns[r, t] = forced[t]
+            if 0 <= forced[t] // block_stride < n and forced[t] % block_stride == block_begin:
+                forced_columns[r, t] = forced[t] // block_stride
                 scores[r, t, :, forced_columns[r, t]] = torch.nan
             for c in range(n):
-                if c != forced[t]:
-                    dense[:, c] = torch.maximum(dense[:, c], scores[r, t, :, c])
+                block = c * block_stride + block_begin
+                if block != forced[t]:
+                    dense[:, block] = torch.maximum(dense[:, block], scores[r, t, :, c])
         if not length:
             continue
         for h in range(hg):
@@ -122,14 +125,16 @@ def _fragment_inputs(columns, seed):
     return scores, counts, forced_columns, active, forced, ordinary, expected
 
 
+@pytest.mark.parametrize("page_size", [128, 256])
 @pytest.mark.parametrize("columns", [33, 129])
-def test_rank_fragments_forcing_ties_and_graph_slots(icp_group, cuda_device, columns):
+def test_rank_fragments_forcing_ties_and_graph_slots(icp_group, cuda_device, columns, page_size):
     rank, dev, extent = dist.get_rank(icp_group), cuda_device, 64
     exchange = _Exchange(icp_group, rank=rank, heads_local=HL, extents=[extent], device=dev)
     select = _build._select_ext()
+    block_stride, block_begin = page_size // 128, rank * (page_size // WORLD) // 128
     try:
         for layer in range(6):
-            scores, counts, columns_forced, active, forced, ordinary, expected = _fragment_inputs(columns, layer)
+            scores, counts, columns_forced, active, forced, ordinary, expected = _fragment_inputs(columns, layer, page_size)
             tokens = len(active)
             pad = extent - tokens
             mine = torch.nn.functional.pad(scores[rank], (0, 0, 0, 0, 0, pad)).to(dev)
@@ -141,12 +146,12 @@ def test_rank_fragments_forcing_ties_and_graph_slots(icp_group, cuda_device, col
             out = torch.empty((extent, HL, 16), dtype=torch.int32, device=dev)
             candidates = torch.empty((extent, WORLD * HL, 16, 2), dtype=torch.float32, device=dev)
             exchange.publish(mine, nvalid, local_forced, active, layer=layer,
-                             token_offset=0)
+                             token_offset=0, block_begin=block_begin, block_stride=block_stride)
             exchange.merge_decode(out, layer=layer, forced=forced, n_ordinary=ordinary)
             reference = expected[:, rank * HL:(rank + 1) * HL]
             ok = torch.equal(out[:tokens].cpu(), reference) and bool((out[tokens:] == -1).all())
             select.select_prefill_candidates(mine, nvalid, local_forced, active, candidates,
-                                             0, False, global_block_stride=1)
+                                             block_begin, False, global_block_stride=block_stride)
             exchange.merge_prefill(candidates.view(torch.int32), out, forced=forced,
                                    n_ordinary=ordinary)
             ok &= torch.equal(out[:tokens].cpu(), reference) and bool((out[tokens:] == -1).all())
@@ -158,7 +163,7 @@ def test_rank_fragments_forcing_ties_and_graph_slots(icp_group, cuda_device, col
         with torch.cuda.graph(graph):
             for layer in range(3):
                 exchange.publish(mine, nvalid, local_forced, active, layer=layer,
-                                 token_offset=0)
+                                 token_offset=0, block_begin=block_begin, block_stride=block_stride)
                 exchange.merge_decode(out, layer=layer, forced=forced, n_ordinary=ordinary)
         for _ in range(4):
             out.fill_(-77)

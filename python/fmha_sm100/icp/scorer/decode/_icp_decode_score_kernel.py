@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TP2/TP4 P128 index-fragment decode scorer (FP8 E4M3, H4, D128).
+"""TP2/TP4 P128/P256 index-fragment decode scorer (FP8 E4M3, H4, D128).
 
 Adapted from vLLM IndexDecodeScoreKernel at 9de0daa25f47; mma.sync rather than
 tcgen05 because the score GEMM's tiny N favours CTA occupancy over a deep pipeline.
@@ -183,7 +183,7 @@ class IndexDecodeScoreKernel:
         self.head_dim = head_dim
         self.query_len = query_len
         self.rank = rank
-        assert world_size in (2, 4) and page_size == 128
+        assert world_size in (2, 4) and page_size in (128, 256)
         assert 0 <= rank < world_size
         self.page_size = page_size
         self.BLOCK_K = page_size // world_size

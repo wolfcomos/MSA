@@ -89,13 +89,13 @@ class _Exchange:
         torch.cuda.synchronize(index)
 
     def publish(self, scores, nvalid, forced_column, active, *, layer: int,
-                token_offset: int) -> None:
+                token_offset: int, block_begin: int = 0, block_stride: int = 1) -> None:
         """Select decode rows ``[token_offset, +len(scores))`` into the owners' windows."""
         self.mod.fused_select_publish(
             scores, nvalid, forced_column, active, self._ptrs, self._pub_gen, self._status,
             self.rank, self.world, self.hl, token_offset,
             layer % _SLOTS, _SLOTS, self.T, self.slot_words,
-            0, 1, self._select_flags)
+            block_begin, block_stride, self._select_flags)
 
     def merge_decode(self, out, *, layer: int, forced, n_ordinary) -> None:
         """Poll + merge this layer's published rows into ``out``."""

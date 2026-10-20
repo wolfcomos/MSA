@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
-"""Prewarmed FP8 decode scoring for TP2/TP4, with independent P128 index pages.
+"""Prewarmed FP8 decode scoring for TP2/TP4, with P128/P256 index pages.
 
 One AOT scan per ``(query_len, rank)`` serves uniform Q1-Q4 decode; the token window,
 request range and split are launch scalars. Call order: ``scan(index_q, index_k,
@@ -80,9 +80,10 @@ def _trace_scan(query_len, rank, page_size=128, world_size=2):
 
 def _aot_function_name(query_len, rank, page_size=128, world_size=2):
     """The AOT object's exported symbol for one profile."""
-    if page_size != 128 or world_size not in (2, 4) or not 0 <= rank < world_size:
-        raise ValueError("ICP decode requires TP2/TP4 ranks and 128-token index pages")
-    suffix = "" if world_size == 2 else f"_w{world_size}"
+    if page_size not in (128, 256) or world_size not in (2, 4) or not 0 <= rank < world_size:
+        raise ValueError("ICP decode requires TP2/TP4 ranks and P128/P256 index pages")
+    suffix = "" if page_size == 128 else f"_p{page_size}"
+    suffix += "" if world_size == 2 else f"_w{world_size}"
     return f"icp_decode_scan_q{int(query_len)}_r{int(rank)}_s{_NUM_STAGES}_pdl{suffix}"
 
 

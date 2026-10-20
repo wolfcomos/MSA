@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 
 import torch
-from torch.utils.cpp_extension import _get_build_directory, load
+from torch.utils.cpp_extension import load
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_THIS_DIR, "build_k2q_csr.cu")
@@ -33,13 +33,8 @@ _extra_cuda_cflags = [
     "-I/usr/local/cuda/include/cccl",
 ]
 
-_NAME = "sparse_build_k2q_csr_ext"
-if os.environ.get("ICP_RUNTIME_JIT") == "fail" and not os.path.isfile(
-        os.path.join(_get_build_directory(_NAME, False), f"{_NAME}.so")):
-    raise RuntimeError(f"runtime JIT of nvfp4:{_NAME} refused (ICP_RUNTIME_JIT=fail)")
-
 _ext = load(
-    name=_NAME,
+    name="sparse_build_k2q_csr_ext",
     sources=[_SRC],
     extra_cflags=_extra_cflags,
     extra_cuda_cflags=_extra_cuda_cflags,

@@ -339,4 +339,5 @@ is internal and may change without notice.
 
 `fmha_sm100.icp` is the TP2/TP4 indexer-context-parallel sparse indexer over independent P128 index caches (`IcpIndexer`, `IcpStep`);
 `python -m fmha_sm100.icp.prewarm build|verify` compiles or checks every kernel it serves.
+Optional compound P128/P256 pages share storage with main KV; `--include-main-attention` also prewarms their NVFP4 consumers.
 See [the integration contract](docs/ICP_INTEGRATION.md).

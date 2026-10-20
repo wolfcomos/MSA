@@ -6,6 +6,11 @@ fragment of every 128-token page, selects local top-16 candidates and exchanges 
 the other ranks. The engine owns the KV writer, per-step live metadata and OnlyScoreIcp
 device plans, config admission, graph capture and lifetime.
 
+Optional compound pages combine NVFP4 main KV and FP8 index K at TP2/TP4 with physical
+P128/P256 pages. Each rank owns `page_size / TP` contiguous index rows; ranking blocks
+remain B128. Pass `page_size=256` to `IcpIndexer` for P256 storage. Index views retain the
+compound page stride without a pack copy.
+
 ## Public API
 
 ```python
@@ -41,4 +46,8 @@ python -m fmha_sm100.icp.prewarm verify --arch 107a --world-size 4   # prints IC
 `prewarm.warm()` and `prewarm.check()` run the same loads in-process; `check()`
 sets `ICP_RUNTIME_JIT=fail` and returns one line per artifact that would compile.
 ICP extensions and decode scans are keyed by a source digest under `ICP_CACHE_ROOT`; the
-OnlyScoreIcp FMHA variants use the usual MSA cache. Main-attention kernels are not included.
+OnlyScoreIcp FMHA variants use the usual MSA cache. Main-attention kernels are excluded by
+default. For P256 compound caches, add `--page-size 256 --include-main-attention` to both
+commands to include generic NVFP4 decode and BF16/FP8-query prefill; use `--page-size 128`
+for P128. In-process, pass the matching `page_size`, `world_size` and
+`include_main_attention=True` to `warm()` or `check()`.

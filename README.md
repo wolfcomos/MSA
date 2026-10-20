@@ -337,6 +337,6 @@ is internal and may change without notice.
 
 ## Indexer context parallelism
 
-`fmha_sm100.icp` is the TP2 indexer-context-parallel sparse indexer (`IcpIndexer`, `IcpStep`);
+`fmha_sm100.icp` is the TP2/TP4 indexer-context-parallel sparse indexer over independent P128 index caches (`IcpIndexer`, `IcpStep`);
 `python -m fmha_sm100.icp.prewarm build|verify` compiles or checks every kernel it serves.
 See [the integration contract](docs/ICP_INTEGRATION.md).

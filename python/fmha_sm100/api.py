@@ -13,6 +13,7 @@ from typing import Optional, Tuple, Union
 
 __all__ = [
     "fmha_sm100_plan", "fmha_sm100", "sparse_topk_select", "nvfp4_head_slot_views",
+    "fmha_index_score_sharded_plan", "fmha_index_score_sharded",
     "_fmha_sm100_plan", "_fmha_sm100",
 ]
 
@@ -525,7 +526,8 @@ def _fmha_sm100_plan(
     sparse_kernel_mode: str = 'auto',
     use_fp8_kvcache: bool = False,
     device = None,
-    stream = None
+    stream = None,
+    qo_tile_size: Optional[int] = None,
 ):
     device = torch.cuda.current_device() if device is None else device
     _reset_np_staging()
@@ -610,7 +612,8 @@ def _fmha_sm100_plan(
         plan_qo_offset = None
 
     max_qo_len = max(qo_lens)
-    qo_tile_size = 128 if max_qo_len <= 128 else 256
+    if qo_tile_size is None:
+        qo_tile_size = 128 if max_qo_len <= 128 else 256
     kv_tile_size = 256 if qo_tile_size == 128 else 128
 
     total_qo_len = qo_offsets[-1]
@@ -1508,3 +1511,67 @@ def sparse_topk_select(
     )
 
     return output_indices
+
+
+def fmha_index_score_sharded_plan(qo_segment_lens, kv_segment_lens, num_qo_heads,
+                                  *, qo_offset, device=None):
+    """Plan TP2/P128 index scores with Q128 tiles and no head packing or KV split."""
+    plan = _fmha_sm100_plan(
+        qo_segment_lens, kv_segment_lens, num_qo_heads,
+        num_kv_heads=-1, qo_offset=qo_offset, num_kv_splits=1,
+        page_size=128, output_maxscore=True, causal=True,
+        device=device, qo_tile_size=128,
+    )
+    plan["index_score_sharded_shape"] = (int(qo_segment_lens.sum()), num_qo_heads)
+    plan["index_score_sharded_columns"] = (int(kv_segment_lens.max()) + 127) // 128
+    return plan
+
+
+def fmha_index_score_sharded(q, k, block_table, plan_info, *, rank,
+                             max_score, valid_score, sm_scale):
+    """Score interleaved TP2/P128 index K into bounded [T,H,B128] buffers.
+
+    q is FP8 [T,H,128], k is FP8 [pages,64,128], and block_table contains
+    physical P128 page IDs. max_score is float32 and valid_score is uint8;
+    both scratch buffers are supplied by the caller and fully overwritten.
+    Scores are raw QK maxima, matching the ordinary OnlyScore path.
+    """
+    if rank not in (0, 1):
+        raise ValueError("sharded index scoring requires TP2 rank 0 or 1")
+    if (q.ndim != 3 or q.shape[-1] != 128 or
+            q.dtype != torch.float8_e4m3fn or k.dtype != q.dtype or
+            k.ndim != 3 or tuple(k.shape[1:]) != (64, 128) or
+            not q.is_contiguous() or not k.is_contiguous()):
+        raise ValueError("expected FP8 q [T,H,128] and k [pages,64,128]")
+    if (plan_info.get("index_score_sharded_shape") != tuple(q.shape[:2]) or
+            plan_info["pack_factor"] != 1 or plan_info["num_kv_splits"] != 1):
+        raise ValueError("use fmha_index_score_sharded_plan for this query shape")
+    if (max_score.ndim != 3 or tuple(max_score.shape[:2]) != tuple(q.shape[:2]) or
+            max_score.shape[-1] < max(1, plan_info["index_score_sharded_columns"]) or
+            max_score.dtype != torch.float32 or
+            valid_score.shape != max_score.shape or valid_score.dtype != torch.uint8):
+        raise ValueError("expected matching float32 score and uint8 validity [T,H,K]")
+    if (block_table.ndim != 2 or block_table.dtype != torch.int32 or
+            block_table.shape[0] != plan_info["qo_segment_lens"].shape[0] or
+            block_table.shape[1] < plan_info["index_score_sharded_columns"] or
+            block_table.stride(1) != 1):
+        raise ValueError("expected one int32 block-table row per query segment")
+    if not q.is_cuda or any(t.device != q.device for t in (k, block_table, max_score, valid_score)):
+        raise ValueError("index-scoring inputs and scratch must share one CUDA device")
+    k_pages = k.unsqueeze(1)
+    max_qo_len = plan_info["max_qo_len"]
+    variant = get_fmha_variant(_dlpack_dtype_code(q.dtype), 128, max_qo_len <= 64,
+                              4, 64, False, 1)
+    max_score.fill_(float("-inf"))
+    variant.run(
+        plan_info["cute_workspace_buffer"], q, k_pages, k_pages,
+        plan_info["qo_segment_lens"], plan_info["kv_segment_lens"],
+        plan_info["qo_segment_offsets"], plan_info["kv_segment_offsets"],
+        plan_info["packed_work_range"], plan_info["packed_work_info"],
+        None, sm_scale, 1.0, 1.0, 1.0, 1.0, max_qo_len,
+        plan_info["qo_offset"], 1, None, None, None, None, None, None,
+        128, block_table, None, max_score, max_score.shape[-1], None,
+        1, bool(plan_info["qo_len_uniform"]),
+        torch.cuda.current_stream(q.device).cuda_stream,
+        valid_score, block_table.stride(0), 0, rank, 2,
+    )

@@ -78,11 +78,13 @@ _FMHA_SM100_DISPATCH = [
         (1,    {"sparse_mode": "Full"}),
         (2,    {"sparse_mode": "OnlyScore"}),
         (None, {"sparse_mode": "Off"}),
+        (4,    {"sparse_mode": "OnlyScoreIcp"}),
     ]),
     ("int page_size", [
         (-1,  {"page_size": -1}),
         (128, {"page_size": 128}),
         # (256, {"page_size": 256}),
+        (64,  {"page_size": 64, "tile_kv": "_128"}),
     ]),
     ("bool split_kv", [
         ("false", {"is_split_kv": "false"}),
@@ -113,6 +115,11 @@ _FMHA_SM100_IMPOSSIBLE = lambda p: (
     (p.get("tile_q") == "_256" and p.get("is_split_kv") == "true") or
     (p.get("page_size") == -1 and p.get("sparse_mode") == "Sparse") or
     (p.get("pack_factor", 1) > 1 and p.get("tile_q") == "_256") or
+    ((p.get("sparse_mode") == "OnlyScoreIcp") != (p.get("page_size") == 64)) or
+    (p.get("sparse_mode") == "OnlyScoreIcp" and (
+        p.get("dtype_in") != "__nv_fp8_e4m3" or p.get("tile_q") != "_128" or
+        p.get("is_split_kv") == "true" or p.get("pack_factor", 1) != 1 or
+        p.get("kv_mode", 0) != 0)) or
     # NVFP4 uses the FP8 single-softmax-warpgroup decoder with page-128 tiles.
     (p.get("kv_mode", 0) >= 3 and (
         p.get("page_size") != 128 or p.get("single_wg") != "true" or
@@ -143,13 +150,16 @@ def _variant_key_from_runtime(dtype_code, qo_tile_size, single_wg,
         # Convert Python bool to string to match dispatch table ("true"/"false")
         if isinstance(runtime_val, bool):
             runtime_val = "true" if runtime_val else "false"
+        fallback_idx = len(dim_values) - 1
         for idx, (match_val, _) in enumerate(dim_values):
             if match_val is None:
+                fallback_idx = idx
+            elif match_val == runtime_val:
                 return idx
-            if match_val == runtime_val:
-                return idx
-        return len(dim_values) - 1
+        return fallback_idx
 
+    if sparse_mode != 4 and page_size not in (-1, 128):
+        page_size = 128
     runtime_vals = [dtype_code, qo_tile_size, single_wg, sparse_mode,
                     page_size, split_kv, pack_factor]
     indices = []

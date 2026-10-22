@@ -41,7 +41,9 @@ enum class SparseAttnMode {
   Off,
   OnlyScore,
   Full,
-  Sparse
+  Sparse,
+  // OnlyScore over this rank's interleaved B128 index-K rows.
+  OnlyScoreIcp
 };
 
 struct NoMask {
@@ -335,6 +337,15 @@ struct PackedCausalMask : NoMask {
 
 template <int PF>
 struct pack_factor_of<PackedCausalMask<PF>> { static constexpr int value = PF; };
+
+// The OnlyScoreIcp prefill scorer's mask: the same mask with a 16-deep K ring.
+template <class Mask>
+struct IcpPrefillMask : Mask {};
+
+template <class Mask>
+struct kv_stage_count_of { static constexpr int value = 0; };
+template <class Mask>
+struct kv_stage_count_of<IcpPrefillMask<Mask>> { static constexpr int value = 16; };
 
 struct VariableLength {
   int* segment_lens = nullptr;

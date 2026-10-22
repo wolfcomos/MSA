@@ -40,7 +40,12 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
                     Optional<ffi::TensorView> maybe_kv_block_indexes,
                     int64_t pack_factor,
                     bool qo_len_uniform,
-                    int64_t stream_ptr
+                    int64_t stream_ptr{% if sparse_mode == "OnlyScoreIcp" %},
+                    ffi::TensorView valid_score,
+                    int64_t icp_block_table_row_stride,
+                    int64_t icp_block_table_row_begin,
+                    int64_t icp_rank,
+                    int64_t icp_c{% endif %}
 {% if kv_mode >= 3 %}
                     ,
                     Optional<ffi::TensorView> maybe_nvfp4_k_data,
@@ -195,7 +200,41 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
   params.kv_block_indexes_ptr = kv_block_indexes_ptr;
   params.kv_block_num = maybe_kv_block_indexes.has_value()
                             ? static_cast<int>(maybe_kv_block_indexes.value().size(2))
-                            : 0;
+                            : 0;{% if sparse_mode == "OnlyScoreIcp" %}
+  // OnlyScoreIcp: kv_indices is the block table; rank and world size ride kv_block_num.
+  TVM_FFI_ICHECK(icp_c == 2 && icp_rank >= 0 && icp_rank < icp_c && page_size * icp_c == 128)
+      << "OnlyScoreIcp serves TP2 64-row fragments; got icp_c=" << icp_c
+      << " icp_rank=" << icp_rank << " page_size=" << page_size;
+  params.kv_block_num = static_cast<int>(icp_rank * 16 + icp_c);
+  TVM_FFI_ICHECK(maybe_kv_indices.has_value() && !maybe_kv_page_indptr.has_value()
+                 && !maybe_kv_block_indexes.has_value())
+      << "OnlyScoreIcp takes the block table as kv_indices and no other page directory";
+  const auto& block_table = maybe_kv_indices.value();
+  TVM_FFI_ICHECK(encode_dlpack_dtype(block_table.dtype()) == int32_code
+                 && block_table.ndim() == 2 && block_table.stride(1) == 1
+                 && icp_block_table_row_stride > 0
+                 && block_table.stride(0) == icp_block_table_row_stride)
+      << "the ICP block table must be int32 [rows, row_stride] with unit column stride";
+  TVM_FFI_ICHECK(icp_block_table_row_begin >= 0
+                 && icp_block_table_row_begin + params.batch_size <= block_table.size(0))
+      << "ICP block table rows [" << icp_block_table_row_begin << ", "
+      << icp_block_table_row_begin + params.batch_size << ") exceed " << block_table.size(0);
+  params.icp_block_table_row_stride = static_cast<int>(icp_block_table_row_stride);
+  params.icp_block_table_row_begin = static_cast<int>(icp_block_table_row_begin);
+  TVM_FFI_ICHECK(maybe_max_score.has_value()
+                 && maybe_max_score.value().size(0) == q.size(0)
+                 && maybe_max_score.value().size(1) == q.size(1))
+      << "OnlyScoreIcp writes a [T, H, K] max_score";
+  const auto& max_score = maybe_max_score.value();
+  TVM_FFI_ICHECK(encode_dlpack_dtype(valid_score.dtype()) == uint8_code && valid_score.ndim() == 3
+                 && valid_score.size(0) == max_score.size(0)
+                 && valid_score.size(1) == max_score.size(1)
+                 && valid_score.size(2) == max_score.size(2))
+      << "valid_score must be uint8 and shaped like max_score";
+  params.valid_score_ptr = static_cast<uint8_t*>(valid_score.data_ptr());
+  params.valid_score_stride_t = static_cast<int>(valid_score.stride(0));
+  params.valid_score_stride_h = static_cast<int>(valid_score.stride(1));
+  params.valid_score_stride_k = static_cast<int>(valid_score.stride(2));{% endif %}
 
   params.pack_factor = static_cast<int>(pack_factor);
   params.num_ctas = static_cast<int>(packed_work_range.size(0));
@@ -283,7 +322,9 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
   params.gmem_bounds.kv_page_indptr_size = maybe_kv_page_indptr.has_value()
       ? static_cast<int>(maybe_kv_page_indptr.value().size(0)) : 0;
   params.gmem_bounds.kv_indices_size = maybe_kv_indices.has_value()
-      ? static_cast<int>(maybe_kv_indices.value().size(0)) : 0;
+      ? static_cast<int>(maybe_kv_indices.value().size(0)) : 0;{% if sparse_mode == "OnlyScoreIcp" %}
+  params.gmem_bounds.kv_indices_size =
+      static_cast<int>(maybe_kv_indices.value().size(0) * maybe_kv_indices.value().stride(0));{% endif %}
   params.gmem_bounds.max_score_numel = maybe_max_score.has_value()
       ? static_cast<int>(maybe_max_score.value().size(0)
                          * maybe_max_score.value().size(1)

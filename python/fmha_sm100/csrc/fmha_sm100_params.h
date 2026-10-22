@@ -86,6 +86,14 @@ struct FMHACutlassSM100Params {
   const float* nvfp4_v_global_scale = nullptr;
 
   GMEM_BOUNDS_FIELD
+
+  // OnlyScoreIcp: validity plane and the direct block table's row pitch/origin.
+  uint8_t* valid_score_ptr = nullptr;
+  int valid_score_stride_t = 0;
+  int valid_score_stride_h = 0;
+  int valid_score_stride_k = 0;
+  int icp_block_table_row_stride = 0;
+  int icp_block_table_row_begin = 0;
 };
 
 using FMHAVariantFn = cudaError_t (*)(const FMHACutlassSM100Params&);

@@ -263,6 +263,19 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     return apply_variable_length(params.problem_shape, batch_idx);
   }
 
+  // No KV tiles: kv_len == 0, or an ICP shard with no local pages. Every role
+  // uses this one predicate, so the loader's page clamp stays in bounds.
+  template <class LogicalProblemShape>
+  CUTLASS_DEVICE static bool is_empty_work(LogicalProblemShape const& logical_problem_shape,
+                                           Params const& params) {
+    if (get<1>(logical_problem_shape) == 0) return true;
+    if constexpr (CollectiveMainloop::kNeedIcp) {
+      return CollectiveMainloop::icp_local_blocks(
+                 logical_problem_shape, params.mainloop.load.kv_block_num) == 0;
+    }
+    return false;
+  }
+
   CUTLASS_DEVICE void operator()(const Params& params, char* smem) {
     GPU_TRACE_INIT;
 
@@ -384,7 +397,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        if (get<1>(logical_problem_shape) == 0) {  // kv_len == 0
+        if (is_empty_work(logical_problem_shape, params)) {  // kv_len == 0
           work_idx++;
           continue;
         }
@@ -582,7 +595,11 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        if (get<1>(logical_problem_shape) == 0) {
+        if (is_empty_work(logical_problem_shape, params)) {
+          // ABI W5: an empty ICP shard still writes its advertised wave invalid.
+          mainloop.icp_write_invalid_wave(blk_coord, params.mainloop,
+                                          params.problem_shape,
+                                          logical_problem_shape, epilogue);
           continue;
         }
 
@@ -593,6 +610,9 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           if (CollectiveMainloop::get_effective_trip_count(
                   blk_coord, logical_problem_shape,
                   kv_tile_begin, kv_tile_end, params.mainloop.load.kv_block_num) <= 0) {
+            mainloop.icp_write_invalid_wave(blk_coord, params.mainloop,
+                                            params.problem_shape,
+                                            logical_problem_shape, epilogue);
             continue;
           }
           mainloop.template softmax<kSingleSoftmaxWarpGroup>(
@@ -627,7 +647,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        if (get<1>(logical_problem_shape) == 0) {
+        if (is_empty_work(logical_problem_shape, params)) {
           mainloop.correction_empty(blk_coord, params.mainloop, logical_problem_shape,
                                     params.problem_shape, shared_storage.epilogue,
                                     pipeline_corr_epi, pipeline_corr_epi_producer_state, epilogue);
@@ -689,7 +709,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        if (get<1>(logical_problem_shape) == 0) {
+        if (is_empty_work(logical_problem_shape, params)) {
           continue;
         }
 
@@ -781,7 +801,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
             continue;
           }
-          if (get<1>(logical_problem_shape) == 0) {  // kv_len == 0
+          if (is_empty_work(logical_problem_shape, params)) {  // kv_len == 0
             continue;
           }
 

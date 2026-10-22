@@ -43,8 +43,10 @@
 #define FLASHINFER_SPARSE_TOPK_SELECT_CUH_
 
 #include <cuda.h>
+#include <cuda/atomic>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
 #include <cfloat>
 #include <cstdint>
@@ -697,7 +699,41 @@ constexpr int kIndexerNumBins = 1024;  // 10-bit hist (was 2048 / 11-bit)
 constexpr int kIndexerNumFinalItems = 2048;
 constexpr int kIndexerQuadraticSelectionLimit = 416;
 
-template <uint32_t MAX_TOPK>
+struct SparseTopKPublish {
+  const int64_t* recv_bases = nullptr;
+  int32_t* errors = nullptr;
+  uint32_t slot = 0, rank = 0, world = 0, heads_per_rank = 0, capacity = 0;
+  uint32_t spin_limit = 0;
+
+  // Warp 0 publishes after acquiring the empty slot; merge releases it.
+  __device__ void operator()(uint32_t token, uint32_t head, const float* scores,
+                            int32_t id) const {
+    const uint32_t lane = threadIdx.x & 31;
+    int32_t* peer = reinterpret_cast<int32_t*>(recv_bases[head / heads_per_rank]);
+    int32_t* row = peer +
+        (((static_cast<size_t>(slot) * world + rank) * heads_per_rank +
+          head % heads_per_rank) * capacity + token) * 33;
+    cuda::atomic_ref<int32_t, cuda::thread_scope_system> ready(row[32]);
+    if (lane == 0) {
+      uint32_t spins = 0;
+      while (ready.load(cuda::memory_order_acquire) != 0) {
+        if (++spins >= spin_limit) {
+          atomicAdd(errors, 1);
+          asm volatile("trap;");
+        }
+      }
+    }
+    __syncwarp();
+    if (lane < 16) {
+      row[lane] = __float_as_int(id >= 0 ? scores[id] : -CUDART_INF_F);
+      row[16 + lane] = id;
+    }
+    __syncwarp();
+    if (lane == 0) ready.store(1, cuda::memory_order_release);
+  }
+};
+
+template <uint32_t MAX_TOPK, bool PUBLISH = false>
 __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSortKernel(
     const float* __restrict__ in,        // row-contig fp32: (H, T, K) or (T, H, K)
     int32_t* __restrict__ out,           // (qo, num_qo_heads, topk) logical int32
@@ -714,7 +750,8 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     uint32_t num_valid_pages,
     const int32_t* __restrict__ num_valid_pages_per_token,
     uint32_t force_begin, uint32_t force_end,
-    uint32_t input_qo_outermost, uint32_t use_pdl) {
+    uint32_t input_qo_outermost, uint32_t use_pdl, SparseTopKPublish publish) {
+  static_assert(!PUBLISH || MAX_TOPK == 16);
   static_assert(MAX_TOPK <= kSparseTopkMaxK, "MAX_TOPK exceeds supported max");
 
   constexpr int kNumThreadsPerBlock = kIndexerNumThreadsPerBlock;
@@ -801,10 +838,18 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   // histogram path so large -inf padding ties cannot manufacture arbitrary
   // duplicate/OOB selections.
   if (row_num_valid_pages <= static_cast<uint32_t>(topK)) {
-    int32_t* row_out = out + row_offset_out;
     const int valid_count = (row_num_valid_pages < static_cast<uint32_t>(rowLen))
                                 ? static_cast<int>(row_num_valid_pages)
                                 : rowLen;
+    if constexpr (PUBLISH) {
+      if (threadIdx.x < 32) {
+        const int32_t id = threadIdx.x < valid_count
+                               ? static_cast<int32_t>(threadIdx.x) : -1;
+        publish(t, qo_head_idx, logits, id);
+      }
+      return;
+    }
+    int32_t* row_out = out + row_offset_out;
     for (int rowIt = threadIdx.x; rowIt < valid_count; rowIt += kNumThreadsPerBlock) {
       row_out[static_cast<size_t>(rowIt) * out_stride_k] =
           GatherBlockTableValue(block_table_row, block_table_stride_k, rowIt);
@@ -822,11 +867,19 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   // ---- Trivial path: rowLen <= topK (defensive — host dispatcher already
   //      catches max_k_tiles <= topk via SparseTopKIdentityFillKernel).
   if (rowLen <= topK) {
-    int32_t* row_out = out + row_offset_out;
     // OOB clamp: indices >= num_valid_pages → -1
     const int valid_count = (static_cast<int>(row_num_valid_pages) < rowLen)
                                 ? static_cast<int>(row_num_valid_pages)
                                 : rowLen;
+    if constexpr (PUBLISH) {
+      if (threadIdx.x < 32) {
+        const int32_t id = threadIdx.x < valid_count
+                               ? static_cast<int32_t>(threadIdx.x) : -1;
+        publish(t, qo_head_idx, logits, id);
+      }
+      return;
+    }
+    int32_t* row_out = out + row_offset_out;
     for (int rowIt = threadIdx.x; rowIt < valid_count; rowIt += kNumThreadsPerBlock) {
       row_out[static_cast<size_t>(rowIt) * out_stride_k] =
           GatherBlockTableValue(block_table_row, block_table_stride_k, rowIt);
@@ -984,7 +1037,8 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   const uint32_t lane = threadIdx.x & 31;
   if (warp_id != 0) return;  // only warp 0 sorts and writes the output
 
-  int32_t* row_out = out + row_offset_out;
+  int32_t* row_out = nullptr;
+  if constexpr (!PUBLISH) row_out = out + row_offset_out;
 
   if constexpr (MAX_TOPK <= 32) {
     // 32 lanes × 1 key.  Lanes >= topk pad with sentinel ~0u (sorts to end).
@@ -998,8 +1052,10 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
       key = valid ? static_cast<uint32_t>(idx) : ~0u;
     }
     WarpBitonicSortAsc32(key, lane);
-    if (lane < topK) {
-      const int32_t logical_idx = (key == ~0u) ? -1 : static_cast<int32_t>(key);
+    const int32_t logical_idx = (key == ~0u) ? -1 : static_cast<int32_t>(key);
+    if constexpr (PUBLISH) {
+      publish(t, qo_head_idx, logits, logical_idx);
+    } else if (lane < topK) {
       row_out[static_cast<size_t>(lane) * out_stride_k] =
           GatherBlockTableValue(block_table_row, block_table_stride_k, logical_idx);
     }
@@ -1073,6 +1129,7 @@ inline cudaError_t LaunchSparseTopKKernel(const void* kernel, dim3 grid, dim3 bl
 #endif
 }
 
+template <bool PUBLISH = false>
 cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
                               const int32_t* block_table,
                               uint64_t out_stride_t, uint64_t out_stride_h,
@@ -1086,11 +1143,12 @@ cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
                               const int32_t* num_valid_pages_per_token,
                               uint32_t force_begin, uint32_t force_end,
                               bool input_qo_outermost,
-                              cudaStream_t stream, bool enable_pdl) {
+                              cudaStream_t stream, bool enable_pdl,
+                              SparseTopKPublish publish = {}) {
   const uint32_t num_rows = total_qo_len * num_qo_heads;
   if (num_rows == 0) return cudaSuccess;
 
-  auto kernel = IndexerTopKWithSortKernel<16>;
+  auto kernel = IndexerTopKWithSortKernel<16, PUBLISH>;
   const size_t dyn_smem_bytes = static_cast<size_t>(topk) * sizeof(int32_t);
   const uint32_t input_qo_outermost_u32 = input_qo_outermost ? 1u : 0u;
   const uint32_t use_pdl = enable_pdl ? 1u : 0u;
@@ -1102,7 +1160,7 @@ cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
                   (void*)&num_qo_heads, (void*)&max_k_tiles, (void*)&topk,
                   (void*)&num_valid_pages, (void*)&num_valid_pages_per_token,
                   (void*)&force_begin, (void*)&force_end, (void*)&input_qo_outermost_u32,
-                  (void*)&use_pdl};
+                  (void*)&use_pdl, (void*)&publish};
   dim3 grid(num_rows);
   dim3 block(kIndexerNumThreadsPerBlock);
   return LaunchSparseTopKKernel((const void*)kernel, grid, block, args, dyn_smem_bytes,

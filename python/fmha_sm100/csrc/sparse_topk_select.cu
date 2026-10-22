@@ -151,5 +151,51 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
       << "sparse_topk_select failed: " << cudaGetErrorString(status);
 }
 
+void sparse_topk_select_publish(TensorView scores, TensorView num_valid_pages,
+                                TensorView recv_bases, TensorView errors,
+                                int64_t slot, int64_t rank, int64_t world,
+                                int64_t heads_per_rank, int64_t capacity,
+                                int64_t force_begin, int64_t force_end,
+                                int64_t spin_limit, int64_t stream_ptr) {
+  CHECK_INPUT(scores);
+  CHECK_DIM(3, scores);
+  CHECK_INPUT(num_valid_pages);
+  CHECK_DIM(1, num_valid_pages);
+  CHECK_INPUT(recv_bases);
+  CHECK_DIM(1, recv_bases);
+  CHECK_INPUT(errors);
+  CHECK_DIM(1, errors);
+  CHECK_DEVICE(scores, num_valid_pages);
+  CHECK_DEVICE(scores, recv_bases);
+  CHECK_DEVICE(scores, errors);
+  TVM_FFI_ICHECK(encode_dlpack_dtype(scores.dtype()) == float32_code);
+  TVM_FFI_ICHECK(encode_dlpack_dtype(num_valid_pages.dtype()) == int32_code);
+  TVM_FFI_ICHECK(encode_dlpack_dtype(recv_bases.dtype()) == int64_code);
+  TVM_FFI_ICHECK(encode_dlpack_dtype(errors.dtype()) == int32_code);
+  TVM_FFI_ICHECK(world == 2 || world == 4);
+  TVM_FFI_ICHECK(heads_per_rank > 0 && scores.size(1) == world * heads_per_rank);
+  TVM_FFI_ICHECK(scores.size(0) == num_valid_pages.size(0));
+  TVM_FFI_ICHECK(scores.size(0) <= capacity && capacity > 0);
+  TVM_FFI_ICHECK(scores.size(2) > 0 && scores.size(2) < 12288);
+  TVM_FFI_ICHECK(recv_bases.size(0) == world && errors.size(0) >= 1);
+  TVM_FFI_ICHECK(slot >= 0 && slot < 3 && rank >= 0 && rank < world);
+  TVM_FFI_ICHECK(force_begin >= 0 && force_end >= 0 && force_begin + force_end <= 16);
+  TVM_FFI_ICHECK(spin_limit > 0 && spin_limit <= INT32_MAX);
+  sparse_topk::SparseTopKPublish publish{
+      TensorDataPtrConst<int64_t>(recv_bases), TensorDataPtr<int32_t>(errors),
+      static_cast<uint32_t>(slot), static_cast<uint32_t>(rank),
+      static_cast<uint32_t>(world), static_cast<uint32_t>(heads_per_rank),
+      static_cast<uint32_t>(capacity), static_cast<uint32_t>(spin_limit)};
+  const cudaError_t status = sparse_topk::LaunchIndexerTopK<true>(
+      TensorDataPtrConst<float>(scores), nullptr, nullptr,
+      0, 0, 0, 0, 0, 0, scores.size(0), scores.size(1), scores.size(2), 16,
+      scores.size(2), TensorDataPtrConst<int32_t>(num_valid_pages),
+      force_begin, force_end, /*input_qo_outermost=*/true,
+      reinterpret_cast<cudaStream_t>(stream_ptr), /*enable_pdl=*/false, publish);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "sparse_topk_select_publish failed: " << cudaGetErrorString(status);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_select_publish, sparse_topk_select_publish);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_select_init, sparse_topk_select_init);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_select, sparse_topk_select);

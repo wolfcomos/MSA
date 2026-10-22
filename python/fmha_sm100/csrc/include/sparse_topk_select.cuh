@@ -822,6 +822,9 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   const int rowStart = 0;
   const int topK = static_cast<int>(topk);
   SparseTopKWaitOnDependentGrids(use_pdl);
+  if constexpr (PUBLISH) {
+    if (threadIdx.x == 0) SparseTopKLaunchDependentGrids(use_pdl);
+  }
   const uint32_t row_num_valid_pages =
       LoadRowNumValidPages(num_valid_pages_per_token, t, num_valid_pages);
   // Padding is always -inf and can never be a useful sparse-attention page.

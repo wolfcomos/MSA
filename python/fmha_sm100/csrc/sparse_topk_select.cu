@@ -156,7 +156,8 @@ void sparse_topk_select_publish(TensorView scores, TensorView num_valid_pages,
                                 int64_t slot, int64_t rank, int64_t world,
                                 int64_t heads_per_rank, int64_t capacity,
                                 int64_t force_begin, int64_t force_end,
-                                int64_t spin_limit, int64_t stream_ptr) {
+                                int64_t spin_limit, bool enable_pdl,
+                                int64_t stream_ptr) {
   CHECK_INPUT(scores);
   CHECK_DIM(3, scores);
   CHECK_INPUT(num_valid_pages);
@@ -191,7 +192,7 @@ void sparse_topk_select_publish(TensorView scores, TensorView num_valid_pages,
       0, 0, 0, 0, 0, 0, scores.size(0), scores.size(1), scores.size(2), 16,
       scores.size(2), TensorDataPtrConst<int32_t>(num_valid_pages),
       force_begin, force_end, /*input_qo_outermost=*/true,
-      reinterpret_cast<cudaStream_t>(stream_ptr), /*enable_pdl=*/false, publish);
+      reinterpret_cast<cudaStream_t>(stream_ptr), enable_pdl, publish);
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "sparse_topk_select_publish failed: " << cudaGetErrorString(status);
 }

@@ -704,15 +704,43 @@ struct SparseTopKPublish {
   int32_t* errors = nullptr;
   uint32_t slot = 0, rank = 0, world = 0, heads_per_rank = 0, capacity = 0;
   uint32_t spin_limit = 0;
+  uint32_t* generations = nullptr;
 
-  // Warp 0 publishes after acquiring the empty slot; merge releases it.
+  // Warp 0 publishes tagged words or acquires/releases a legacy ready row.
   __device__ void operator()(uint32_t token, uint32_t head, const float* scores,
                             int32_t id) const {
     const uint32_t lane = threadIdx.x & 31;
     int32_t* peer = reinterpret_cast<int32_t*>(recv_bases[head / heads_per_rank]);
-    int32_t* row = peer +
-        (((static_cast<size_t>(slot) * world + rank) * heads_per_rank +
-          head % heads_per_rank) * capacity + token) * 33;
+    const size_t row_idx =
+        ((static_cast<size_t>(slot) * world + rank) * heads_per_rank +
+         head % heads_per_rank) * capacity + token;
+    if (generations != nullptr) {
+      uint32_t* counter = generations +
+          (static_cast<size_t>(slot) * world * heads_per_rank + head) * capacity + token;
+      uint32_t generation = 0;
+      if (lane == 0) {
+        generation = *counter + 1u;
+        if (generation == 0) generation = 1;
+      }
+      generation = __shfl_sync(0xffffffffu, generation, 0);
+      if (lane < 16) {
+        uint64_t* row = reinterpret_cast<uint64_t*>(peer) + row_idx * 32;
+        const uint64_t tag = static_cast<uint64_t>(generation) << 32;
+        const uint64_t score =
+            tag | __float_as_uint(id >= 0 ? scores[id] : -CUDART_INF_F);
+        const uint64_t index = tag | static_cast<uint32_t>(id);
+        asm volatile("st.relaxed.sys.u64 [%0], %1;"
+                     :: "l"(row + lane), "l"(score)
+                     : "memory");
+        asm volatile("st.relaxed.sys.u64 [%0], %1;"
+                     :: "l"(row + 16 + lane), "l"(index)
+                     : "memory");
+      }
+      __syncwarp();
+      if (lane == 0) *counter = generation;
+      return;
+    }
+    int32_t* row = peer + row_idx * 33;
     cuda::atomic_ref<int32_t, cuda::thread_scope_system> ready(row[32]);
     if (lane == 0) {
       uint32_t spins = 0;

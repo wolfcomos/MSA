@@ -157,6 +157,7 @@ void sparse_topk_select_publish(TensorView scores, TensorView num_valid_pages,
                                 int64_t heads_per_rank, int64_t capacity,
                                 int64_t force_begin, int64_t force_end,
                                 int64_t spin_limit, bool enable_pdl,
+                                Optional<TensorView> maybe_generations,
                                 int64_t stream_ptr) {
   CHECK_INPUT(scores);
   CHECK_DIM(3, scores);
@@ -187,6 +188,18 @@ void sparse_topk_select_publish(TensorView scores, TensorView num_valid_pages,
       static_cast<uint32_t>(slot), static_cast<uint32_t>(rank),
       static_cast<uint32_t>(world), static_cast<uint32_t>(heads_per_rank),
       static_cast<uint32_t>(capacity), static_cast<uint32_t>(spin_limit)};
+  if (maybe_generations.has_value()) {
+    TensorView generations = maybe_generations.value();
+    CHECK_INPUT(generations);
+    CHECK_DIM(3, generations);
+    CHECK_DEVICE(scores, generations);
+    TVM_FFI_ICHECK(encode_dlpack_dtype(generations.dtype()) == int32_code);
+    TVM_FFI_ICHECK(generations.size(0) == 3 &&
+                  generations.size(1) == world * heads_per_rank &&
+                  generations.size(2) == capacity);
+    publish.generations =
+        reinterpret_cast<uint32_t*>(TensorDataPtr<int32_t>(generations));
+  }
   const cudaError_t status = sparse_topk::LaunchIndexerTopK<true>(
       TensorDataPtrConst<float>(scores), nullptr, nullptr,
       0, 0, 0, 0, 0, 0, scores.size(0), scores.size(1), scores.size(2), 16,

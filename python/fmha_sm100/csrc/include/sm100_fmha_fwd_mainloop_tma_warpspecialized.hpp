@@ -178,14 +178,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   // OnlyScoreIcp packs kv_block_num = rank * 16 + world_size.
   CUTLASS_DEVICE static int icp_c_of(int packed) { return packed & 15; }
   CUTLASS_DEVICE static int icp_rank_of(int packed) { return packed >> 4; }
-  // This rank's local blocks of the global kv length; floored at 0 so an empty shard masks page 0.
-  template <class ProblemShape>
-  CUTLASS_DEVICE static int icp_local_blocks(ProblemShape const& problem_shape, int packed) {
-    int C = icp_c_of(packed);
-    int r = icp_rank_of(packed);
-    int rows = max(0, (int(get<1>(problem_shape)) + C - 1 - r) / C);
-    return (rows + KVPageSize - 1) / KVPageSize;
-  }
   // OnlyScore mode: correction's only real work is writing max_score to GMEM
   // (rescale paths are kNeedOutput-gated). Let softmax do the GMEM write
   // directly from its tile_max register, and have correction skip its own
@@ -1322,145 +1314,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     }  // end step()
   };
 
-  // ABI W5 on an empty shard: every role skips the item, so write the advertised
-  // wave invalid with plain stores and no pipeline traffic.
-  template <class BlkCoord, class ProblemShape, class ParamsProblemShape,
-            class CollectiveEpilogue>
-  CUTLASS_DEVICE void icp_write_invalid_wave(BlkCoord const& blk_coord,
-                                             Params const& params,
-                                             ParamsProblemShape const& params_problem_shape,
-                                             ProblemShape const& problem_shape,
-                                             CollectiveEpilogue const& epilogue) {
-    if constexpr (!(kNeedIcp && kFuseMaxScoreIntoSoftmax)) {
-      return;
-    } else {
-      if (params.load.icp.valid_score == nullptr) return;
-      const int pwave = params.load.icp.max_k_tiles;
-      if (pwave <= 0) return;
-
-      const int qo_len = int(get<0>(problem_shape));
-      const int tile_q = int(get<0>(TileShape{}));
-      const int row_begin = int(get<0>(blk_coord)) * tile_q;
-      int row_end = row_begin + tile_q;
-      if (row_end > qo_len) row_end = qo_len;
-      if (row_begin >= row_end) return;
-
-      const int qo_head_idx = get<2, 0>(blk_coord);
-      const int batch_idx = get<2, 1>(blk_coord);
-      const int seg_off_sz = get<3, 1>(params_problem_shape) + 1;
-      const int segment_offset =
-          SEG_OFF_LOAD(get<0>(params_problem_shape), batch_idx, seg_off_sz);
-
-      uint8_t* vs = params.load.icp.valid_score
-                  + qo_head_idx * params.load.icp.valid_score_stride_h;
-      float* ms = epilogue.params.ptr_MaxScore_direct
-                      ? epilogue.params.ptr_MaxScore_direct
-                      : epilogue.params.ptr_MaxScore;
-      const int vs_t = params.load.icp.valid_score_stride_t;
-      const int vs_k = params.load.icp.valid_score_stride_k;
-      const int ms_t = epilogue.params.max_score_stride_t;
-      const int ms_h = epilogue.params.max_score_stride_h;
-      const int ms_k = epilogue.params.max_score_stride_k;
-      if (ms != nullptr) ms += qo_head_idx * ms_h;
-
-      // Stride by warp: the softmax threads are not one contiguous 128-thread block.
-      const int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
-      const int step = cutlass::NumThreadsPerWarp;
-      const int nrows = row_end - row_begin;
-      const long total = long(nrows) * long(pwave);
-      for (long i = lane; i < total; i += step) {
-        const int rr = int(i / pwave);
-        const int kk = int(i % pwave);
-        const int t = segment_offset + row_begin + rr;
-        vs[long(t) * vs_t + long(kk) * vs_k] = uint8_t(0);
-        if (ms != nullptr) ms[long(t) * ms_t + long(kk) * ms_k] = -INFINITY;
-      }
-    }
-  }
-
-  // Warp-cooperative W5 completion of up to 32 consecutive rows (coalesced THK stores);
-  // all lanes must call it before any per-row guard.
-  template <class ProblemShape, class CollectiveEpilogue>
-  CUTLASS_DEVICE bool icp_complete_contiguous_warp(
-      int abs_row, float* ms_base, uint8_t* vs_base,
-      Params const& params, ProblemShape const& problem_shape,
-      CollectiveEpilogue const& epilogue) {
-    const int pwave = params.load.icp.max_k_tiles;
-    const int ms_t = epilogue.params.max_score_stride_t;
-    const int vs_t = params.load.icp.valid_score_stride_t;
-    // Narrow waves stay on the per-row vector path (GB300-tuned cutoff).
-    if (pwave < 512 || epilogue.params.max_score_stride_k != 1
-        || params.load.icp.valid_score_stride_k != 1
-        || ms_t <= 0 || vs_t <= 0 || (ms_t & 3) || (vs_t & 3)) {
-      return false;
-    }
-    constexpr unsigned kWarpMask = 0xffffffffu;
-    const int lane = int(threadIdx.x) % 32;
-    const int first_row = __shfl_sync(kWarpMask, abs_row, 0);
-    if (first_row < 0) return false;
-    const int qo_len = int(get<0>(problem_shape));
-    // Fall back unless lane i owns row first_row + i (inactive lanes carry -1).
-    const bool owns_row = abs_row == first_row + lane
-        || (abs_row == -1 && first_row + lane >= qo_len);
-    if (!__all_sync(kWarpMask, owns_row)) return false;
-    const auto ms_bits = __shfl_sync(
-        kWarpMask, reinterpret_cast<unsigned long long>(ms_base), 0);
-    const auto vs_bits = __shfl_sync(
-        kWarpMask, reinterpret_cast<unsigned long long>(vs_base), 0);
-    if (!ms_bits || !vs_bits || (ms_bits & 15ull) || (vs_bits & 3ull)) {
-      return false;
-    }
-
-    float* warp_ms = reinterpret_cast<float*>(ms_bits);
-    uint8_t* warp_vs = reinterpret_cast<uint8_t*>(vs_bits);
-    const int icp_r = icp_rank_of(params.load.kv_block_num);
-    constexpr int kRfrag = KVPageSize;
-    const int kv_len = int(get<1>(problem_shape));
-    const int qo_offset = Mask::get_qo_offset(problem_shape);
-    const int row_end = min(first_row + 32, qo_len);
-    CUTLASS_PRAGMA_NO_UNROLL
-    for (int row = first_row; row < row_end; ++row) {
-      float* ms = warp_ms + long(row - first_row) * ms_t;
-      uint8_t* vs = warp_vs + long(row - first_row) * vs_t;
-      const int p = row + qo_offset;
-      int n_eff = min(p + 1, kv_len);
-      if (n_eff < 0) n_eff = 0;
-      const int C = icp_c_of(params.load.kv_block_num);
-      const int l_r = max(0, (n_eff + C - 1 - icp_r) / C);
-      const int n_valid = (l_r + kRfrag - 1) / kRfrag;
-
-      int k = 4 * lane;
-      CUTLASS_PRAGMA_NO_UNROLL
-      for (; k + 3 < pwave; k += 128) {
-        const int remaining = n_valid - k;
-        const int partial = max(0, min(remaining, 3));
-        const uint32_t partial_bits =
-            0x01010101u & ((1u << (8 * partial)) - 1u);
-        *reinterpret_cast<uint32_t*>(vs + k) =
-            remaining >= 4 ? 0x01010101u : partial_bits;
-        if (remaining <= 0) {
-          *reinterpret_cast<float4*>(ms + k) =
-              make_float4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
-        } else if (remaining < 4) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int j = 0; j < 4; ++j) {
-            if (j >= remaining) ms[k + j] = -INFINITY;
-          }
-        }
-      }
-      // One lane owns the short final group; neither plane spills past pwave.
-      CUTLASS_PRAGMA_UNROLL
-      for (int j = 0; j < 4; ++j) {
-        if (k + j < pwave) {
-          const bool valid = k + j < n_valid;
-          vs[k + j] = uint8_t(valid);
-          if (!valid) ms[k + j] = -INFINITY;
-        }
-      }
-    }
-    return true;
-  }
-
   template <bool kSingleWG = false, class Stage, class BlkCoord, class ProblemShape,
             class ParamsProblemShape, class CollectiveEpilogue>
   CUTLASS_DEVICE auto softmax(Stage stage, BlkCoord const& blk_coord, Params const& params,
@@ -1580,7 +1433,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         int pos;
         if constexpr (kNeedIcp) {
           // Keep local row coordinates; the causal mask restores r + C*j.
-          int nloc = icp_local_blocks(problem_shape, params.load.kv_block_num);
+          int nloc = Load::icp_local_blocks_exact(int(get<1>(problem_shape)), params.load.kv_block_num);
           if (int(page_idx) >= nloc) {
             cS = domain_offset(make_coord(q_s, INT_MAX / 4), cS_base);
             return false;
@@ -1625,10 +1478,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     static constexpr int kTilesPerMacro =
         (get<1>(ThreadShape{}) > 1) ? 2 : 1;
     int k_tile_idx_step = -kTilesPerMacro;
-    // OnlyScoreIcp validity row, kept for the W5 completion after the loops.
-    uint8_t* vs_base = nullptr;
-    int vs_stride_k = 0;
-    int icp_abs_row = -1;
 #ifdef FMHA_GMEM_BOUNDS_CHECK
     const float* ms_check_base = nullptr;
     int ms_check_numel = 0;
@@ -1684,17 +1533,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
           }
         } else {
           packed_maxscore_path();
-        }
-
-        // The validity plane is shape-matched to max_score: same (t, h) offsets.
-        if constexpr (kNeedIcp) {
-          if (params.load.icp.valid_score != nullptr) {
-            vs_base = params.load.icp.valid_score
-                    + (segment_offset + abs_row) * params.load.icp.valid_score_stride_t
-                    + qo_head_idx * params.load.icp.valid_score_stride_h;
-            vs_stride_k = params.load.icp.valid_score_stride_k;
-            icp_abs_row = abs_row;
-          }
         }
       }
 
@@ -1830,84 +1668,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_s.consumer_release(pipeline_s_consumer_state);
     ++pipeline_s_consumer_state;
 
-    // ABI W5: write every advertised score/validity column of this row. Validity is
-    // the per-row causal predicate, not the tile-quantised trip count.
-    if constexpr (kNeedIcp && kFuseMaxScoreIntoSoftmax) {
-      // K-split stages share Q rows; stage 0 completes each row.
-      const bool complete_row = kSingleWG || get<0>(ThreadShape{}) != 1
-                             || int(stage) == 0;
-      bool completed_cooperatively = false;
-      if constexpr (!kSingleWG) {
-        if (complete_row) {
-          completed_cooperatively = icp_complete_contiguous_warp(
-              icp_abs_row, ms_base, vs_base, params, problem_shape, epilogue);
-        }
-      }
-      if (complete_row && !completed_cooperatively
-          && vs_base != nullptr && ms_base != nullptr) {
-        const int icp_r = icp_rank_of(params.load.kv_block_num);
-        constexpr int kRfrag = KVPageSize;
-        const int icp_kv_len = int(get<1>(problem_shape));
-        const int icp_p = icp_abs_row + Mask::get_qo_offset(problem_shape);
-        int n_eff = (icp_p + 1) < icp_kv_len ? (icp_p + 1) : icp_kv_len;
-        if (n_eff < 0) n_eff = 0;
-        const int C = icp_c_of(params.load.kv_block_num);
-        const int l_r = max(0, (n_eff + C - 1 - icp_r) / C);
-        const int n_valid = (l_r + kRfrag - 1) / kRfrag;
-        const int pwave = params.load.icp.max_k_tiles;
-        // Vector stores need unit K stride and aligned row bases.
-        const bool vector_stores = !kSingleWG && get<0>(ThreadShape{}) == 1
-            && vs_stride_k == 1 && ms_stride_k == 1
-            && (reinterpret_cast<uintptr_t>(vs_base) & 3u) == 0
-            && (reinterpret_cast<uintptr_t>(ms_base) & 15u) == 0;
-        if (vector_stores) {
-          const int valid_end = n_valid < pwave ? n_valid : pwave;
-          int k = 0;
-          CUTLASS_PRAGMA_NO_UNROLL
-          for (; k + 3 < valid_end; k += 4) {
-            *reinterpret_cast<uint32_t*>(vs_base + k) = 0x01010101u;
-          }
-          if (k < valid_end && k + 3 < pwave) {
-            // The group straddling the valid/invalid boundary.
-            const int remaining = valid_end - k;
-            *reinterpret_cast<uint32_t*>(vs_base + k) =
-                0x01010101u & ((1u << (8 * remaining)) - 1u);
-            CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < 4; ++j) {
-              if (j >= remaining) ms_base[k + j] = -INFINITY;
-            }
-            k += 4;
-          }
-          CUTLASS_PRAGMA_NO_UNROLL
-          for (; k + 3 < pwave; k += 4) {
-            *reinterpret_cast<uint32_t*>(vs_base + k) = 0u;
-            *reinterpret_cast<float4*>(ms_base + k) =
-                make_float4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
-          }
-          // Tail when pwave is not a multiple of four.
-          for (; k < pwave; ++k) {
-            if (k < n_valid) {
-              vs_base[k] = uint8_t(1);
-            } else {
-              vs_base[k] = uint8_t(0);
-              ms_base[k] = -INFINITY;
-            }
-          }
-        } else {
-          CUTLASS_PRAGMA_NO_UNROLL
-          for (int k = 0; k < pwave; ++k) {
-            if (k < n_valid) {
-              vs_base[k * vs_stride_k] = uint8_t(1);
-            } else {
-              vs_base[k * vs_stride_k] = uint8_t(0);
-              ms_base[k * ms_stride_k] = -INFINITY;
-            }
-          }
-        }
-      }
-    }
     if constexpr (kDirectScorePipeline<kSingleWG>) {
-      // One completion token per stage and item, after all W5 stores.
+      // One completion token per stage and item, after all score stores.
       pipeline_c.producer_commit(pipeline_c_producer_state);
       ++pipeline_c_producer_state;
       pipeline_c.producer_acquire(pipeline_c_producer_state);

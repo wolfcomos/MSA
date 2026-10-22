@@ -76,13 +76,8 @@ struct MaskPackFactor { static constexpr int value = 1; };
 template <int P>
 struct MaskPackFactor<PackedCausalMask<P>> { static constexpr int value = P; };
 
-// OnlyScoreIcp inputs: the validity plane, its advertised column count, and
-// the row pitch/origin of the direct block table passed as kv_indices.
+// OnlyScoreIcp score columns and direct block table passed as kv_indices.
 struct IcpParams {
-  uint8_t* valid_score = nullptr;
-  int valid_score_stride_t = 0;
-  int valid_score_stride_h = 0;
-  int valid_score_stride_k = 0;
   int max_k_tiles = 0;
   int block_table_row_stride = 0;
   int block_table_row_begin = 0;

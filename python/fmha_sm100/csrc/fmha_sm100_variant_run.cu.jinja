@@ -41,7 +41,6 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
                     int64_t pack_factor,
                     bool qo_len_uniform,
                     int64_t stream_ptr{% if sparse_mode == "OnlyScoreIcp" %},
-                    ffi::TensorView valid_score,
                     int64_t icp_block_table_row_stride,
                     int64_t icp_block_table_row_begin,
                     int64_t icp_rank,
@@ -224,17 +223,7 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
   TVM_FFI_ICHECK(maybe_max_score.has_value()
                  && maybe_max_score.value().size(0) == q.size(0)
                  && maybe_max_score.value().size(1) == q.size(1))
-      << "OnlyScoreIcp writes a [T, H, K] max_score";
-  const auto& max_score = maybe_max_score.value();
-  TVM_FFI_ICHECK(encode_dlpack_dtype(valid_score.dtype()) == uint8_code && valid_score.ndim() == 3
-                 && valid_score.size(0) == max_score.size(0)
-                 && valid_score.size(1) == max_score.size(1)
-                 && valid_score.size(2) == max_score.size(2))
-      << "valid_score must be uint8 and shaped like max_score";
-  params.valid_score_ptr = static_cast<uint8_t*>(valid_score.data_ptr());
-  params.valid_score_stride_t = static_cast<int>(valid_score.stride(0));
-  params.valid_score_stride_h = static_cast<int>(valid_score.stride(1));
-  params.valid_score_stride_k = static_cast<int>(valid_score.stride(2));{% endif %}
+      << "OnlyScoreIcp writes a [T, H, K] max_score";{% endif %}
 
   params.pack_factor = static_cast<int>(pack_factor);
   params.num_ctas = static_cast<int>(packed_work_range.size(0));

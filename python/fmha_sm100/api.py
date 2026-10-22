@@ -1519,7 +1519,7 @@ def fmha_index_score_sharded_plan(qo_segment_lens, kv_segment_lens, num_qo_heads
     plan = _fmha_sm100_plan(
         qo_segment_lens, kv_segment_lens, num_qo_heads,
         num_kv_heads=-1, qo_offset=qo_offset, num_kv_splits=1,
-        page_size=128, output_maxscore=True, causal=True,
+        output_maxscore=True, causal=True,
         device=device, qo_tile_size=128,
     )
     plan["index_score_sharded_shape"] = (int(qo_segment_lens.sum()), num_qo_heads)
@@ -1528,12 +1528,12 @@ def fmha_index_score_sharded_plan(qo_segment_lens, kv_segment_lens, num_qo_heads
 
 
 def fmha_index_score_sharded(q, k, block_table, plan_info, *, rank,
-                             max_score, valid_score, sm_scale):
+                             max_score, sm_scale):
     """Score interleaved TP2/P128 index K into bounded [T,H,B128] buffers.
 
     q is FP8 [T,H,128], k is FP8 [pages,64,128], and block_table contains
-    physical P128 page IDs. max_score is float32 and valid_score is uint8;
-    both scratch buffers are supplied by the caller and fully overwritten.
+    physical P128 page IDs. The caller supplies float32 max_score scratch;
+    this function initializes all columns to -inf before scoring visible blocks.
     Scores are raw QK maxima, matching the ordinary OnlyScore path.
     """
     if rank not in (0, 1):
@@ -1548,15 +1548,14 @@ def fmha_index_score_sharded(q, k, block_table, plan_info, *, rank,
         raise ValueError("use fmha_index_score_sharded_plan for this query shape")
     if (max_score.ndim != 3 or tuple(max_score.shape[:2]) != tuple(q.shape[:2]) or
             max_score.shape[-1] < max(1, plan_info["index_score_sharded_columns"]) or
-            max_score.dtype != torch.float32 or
-            valid_score.shape != max_score.shape or valid_score.dtype != torch.uint8):
-        raise ValueError("expected matching float32 score and uint8 validity [T,H,K]")
+            max_score.dtype != torch.float32):
+        raise ValueError("expected float32 score scratch [T,H,K]")
     if (block_table.ndim != 2 or block_table.dtype != torch.int32 or
             block_table.shape[0] != plan_info["qo_segment_lens"].shape[0] or
             block_table.shape[1] < plan_info["index_score_sharded_columns"] or
             block_table.stride(1) != 1):
         raise ValueError("expected one int32 block-table row per query segment")
-    if not q.is_cuda or any(t.device != q.device for t in (k, block_table, max_score, valid_score)):
+    if not q.is_cuda or any(t.device != q.device for t in (k, block_table, max_score)):
         raise ValueError("index-scoring inputs and scratch must share one CUDA device")
     k_pages = k.unsqueeze(1)
     max_qo_len = plan_info["max_qo_len"]
@@ -1573,5 +1572,5 @@ def fmha_index_score_sharded(q, k, block_table, plan_info, *, rank,
         128, block_table, None, max_score, max_score.shape[-1], None,
         1, bool(plan_info["qo_len_uniform"]),
         torch.cuda.current_stream(q.device).cuda_stream,
-        valid_score, block_table.stride(0), 0, rank, 2,
+        block_table.stride(0), 0, rank, 2,
     )

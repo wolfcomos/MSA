@@ -87,11 +87,7 @@ struct FMHACutlassSM100Params {
 
   GMEM_BOUNDS_FIELD
 
-  // OnlyScoreIcp: validity plane and the direct block table's row pitch/origin.
-  uint8_t* valid_score_ptr = nullptr;
-  int valid_score_stride_t = 0;
-  int valid_score_stride_h = 0;
-  int valid_score_stride_k = 0;
+  // OnlyScoreIcp: the direct block table's row pitch/origin.
   int icp_block_table_row_stride = 0;
   int icp_block_table_row_begin = 0;
 };

@@ -163,6 +163,8 @@ __device__ __forceinline__ uint32_t extractBinIdx(float x) {
       return (bits >> 12) & 0x3ff;      // mid 10 bits (was (>> 10) & 0x7ff)
     } else if constexpr (step == 3) {
       return (bits >> 2) & 0x3ff;       // next-low 10 bits, drops bits 0-1
+    } else {
+      return bits & 3u;
     }
   }
 }
@@ -246,7 +248,9 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
                                      int* smemFinalBinSize, int* smemFoundTopKValues,
                                      SmemFinalType& smemFinal, int rowStart, int topK,
                                      uint32_t force_begin, uint32_t force_end_start,
-                                     uint32_t row_num_valid_pages) {
+                                     uint32_t row_num_valid_pages,
+                                     int coarseThreshold = -1) {
+  constexpr bool kPrefill = kNumThreadsPerBlock == 128 && kNumFinalItems == 128;
   // Clear the histogram.
 #pragma unroll
   for (int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock) {
@@ -256,10 +260,10 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
 
   // Update pattern.
   const int prevThresholdBinIdx = thresholdBinIdx;
-  constexpr auto patternShift = step < 2 ? 0 : step == 2 ? 22 : 12;
+  constexpr auto patternShift = step < 2 ? 0 : step == 2 ? 22 : step == 3 ? 12 : 2;
   if constexpr (step == 2) {
     logitPattern = static_cast<uint32_t>(thresholdBinIdx & 0x3ff) << patternShift;
-  } else if constexpr (step == 3) {
+  } else if constexpr (step >= 3) {
     logitPattern |= static_cast<uint32_t>(thresholdBinIdx & 0x3ff) << patternShift;
   }
 
@@ -272,6 +276,9 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
     if constexpr (step == 1) {
       return extractBinIdx<0>(logit) == static_cast<uint32_t>(prevThresholdBinIdx);
     } else {
+      if constexpr (kPrefill && step >= 2) {
+        if (extractBinIdx<0>(logit) != static_cast<uint32_t>(coarseThreshold)) return false;
+      }
       return isPartialMatch<patternShift>(logit, logitPattern);
     }
   };
@@ -280,7 +287,14 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
     logit = effective_logit(logit, idx);
     if (matchesCurrentRefinement(logit)) {
       uint32_t binIdx = extractBinIdx<step>(logit);
-      atomicAdd(&smemFinal.histo.data[binIdx], 1);
+      if constexpr (kPrefill) {
+        const unsigned peers = __match_any_sync(__activemask(), binIdx);
+        if ((threadIdx.x & 31) == __ffs(peers) - 1) {
+          atomicAdd(&smemFinal.histo.data[binIdx], __popc(peers));
+        }
+      } else {
+        atomicAdd(&smemFinal.histo.data[binIdx], 1);
+      }
     }
   };
 
@@ -292,39 +306,64 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
   // Reads the value of the starting position in smemOutput accounting.
   int lastValue = smemFoundTopKValues[0];
 
-  for (int round = 0; round < kNumBins / kNumThreadsPerBlock; round++) {
-    // Read the values from SMEM.
-    int idx = threadIdx.x + kNumThreadsPerBlock * round;
-    int binCount{0};
-    binCount = smemFinal.histo.data[idx];
-    __syncthreads();
-
-    // Compute the prefix sum.
-    int prefixSum{0}, totalSum{0};
+  if constexpr (kPrefill) {
+    // Scan eight contiguous bins per thread with one block scan.
+    constexpr int kBinsPerThread = kNumBins / kNumThreadsPerBlock;
+    const int base = threadIdx.x * kBinsPerThread;
+    int counts[kBinsPerThread], sum = 0;
+#pragma unroll
+    for (int i = 0; i < kBinsPerThread; ++i) {
+      counts[i] = smemFinal.histo.data[base + i];
+      sum += counts[i];
+    }
+    int prefix = 0;
     using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
-    Scan(smemFinal.histo.scan).ExclusiveSum(binCount, prefixSum, totalSum);
-
-    prefixSum += lastValue;
-    totalSum += lastValue;
-    smemFinal.histo.data[idx] = prefixSum;
-    __syncthreads();
-
-    bool foundThreshold = false;
-    if (prefixSum < topK) {
-      int nextPrefixSum = threadIdx.x == kNumThreadsPerBlock - 1
-                              ? totalSum
-                              : smemFinal.histo.data[idx + 1];
-      if (nextPrefixSum >= topK) {
-        smemThresholdBinIdx[0] = idx;
-        smemFinalBinSize[0] = nextPrefixSum - prefixSum;
-        foundThreshold = true;
+    Scan(smemFinal.histo.scan).ExclusiveSum(sum, prefix);
+    prefix += lastValue;
+#pragma unroll
+    for (int i = 0; i < kBinsPerThread; ++i) {
+      if (prefix < topK && prefix + counts[i] >= topK) {
+        smemThresholdBinIdx[0] = base + i;
+        smemFinalBinSize[0] = counts[i];
+        smemFinal.histo.data[base + i] = prefix;
       }
+      prefix += counts[i];
     }
+  } else {
+    for (int round = 0; round < kNumBins / kNumThreadsPerBlock; round++) {
+      // Read the values from SMEM.
+      int idx = threadIdx.x + kNumThreadsPerBlock * round;
+      int binCount{0};
+      binCount = smemFinal.histo.data[idx];
+      __syncthreads();
 
-    if (__syncthreads_or(foundThreshold)) {
-      break;
+      // Compute the prefix sum.
+      int prefixSum{0}, totalSum{0};
+      using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
+      Scan(smemFinal.histo.scan).ExclusiveSum(binCount, prefixSum, totalSum);
+
+      prefixSum += lastValue;
+      totalSum += lastValue;
+      smemFinal.histo.data[idx] = prefixSum;
+      __syncthreads();
+
+      bool foundThreshold = false;
+      if (prefixSum < topK) {
+        int nextPrefixSum = threadIdx.x == kNumThreadsPerBlock - 1
+                                ? totalSum
+                                : smemFinal.histo.data[idx + 1];
+        if (nextPrefixSum >= topK) {
+          smemThresholdBinIdx[0] = idx;
+          smemFinalBinSize[0] = nextPrefixSum - prefixSum;
+          foundThreshold = true;
+        }
+      }
+
+      if (__syncthreads_or(foundThreshold)) {
+        break;
+      }
+      lastValue = totalSum;
     }
-    lastValue = totalSum;
   }
   __syncthreads();
 
@@ -339,7 +378,7 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
         int dstIdx = atomicAdd(&smemFoundTopKValues[0], 1);
         smemOutput[dstIdx] = idx;
       }
-      if constexpr (step < 3) {
+      if constexpr (step < (kPrefill ? 4 : 3)) {
         // Only fill final items for sorting if the threshold bin fits.
         if (binIdx == thresholdBinIdx && smemFinalBinSize[0] <= kNumFinalItems) {
           int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
@@ -348,7 +387,7 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
         }
       } else {
         if (binIdx == thresholdBinIdx) {
-          // Elements in the threshold bin share the same 32 bits at step 3.
+          // Prefill includes the final two bits before resolving exact ties.
           int dstIdx = atomicAdd(&smemFinal.histo.data[binIdx], 1);
           if (dstIdx < topK) {
             smemOutput[dstIdx] = idx;
@@ -778,7 +817,8 @@ struct SparseTopKPrefill {
 };
 
 template <uint32_t MAX_TOPK, bool PUBLISH = false, typename Publisher = SparseTopKPublish>
-__global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSortKernel(
+__global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> ? 128 :
+                                  kIndexerNumThreadsPerBlock)) IndexerTopKWithSortKernel(
     const float* __restrict__ in,        // row-contig fp32: (H, T, K) or (T, H, K)
     int32_t* __restrict__ out,           // (qo, num_qo_heads, topk) logical int32
     const int32_t* __restrict__ block_table,
@@ -798,9 +838,10 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   static_assert(!PUBLISH || MAX_TOPK == 16);
   static_assert(MAX_TOPK <= kSparseTopkMaxK, "MAX_TOPK exceeds supported max");
 
-  constexpr int kNumThreadsPerBlock = kIndexerNumThreadsPerBlock;
+  constexpr bool kPrefill = std::is_same_v<Publisher, SparseTopKPrefill>;
+  constexpr int kNumThreadsPerBlock = kPrefill ? 128 : kIndexerNumThreadsPerBlock;
   constexpr int kNumBins = kIndexerNumBins;
-  constexpr int kNumFinalItems = kIndexerNumFinalItems;
+  constexpr int kNumFinalItems = kPrefill ? 128 : kIndexerNumFinalItems;
   constexpr int kNumWarps = kNumThreadsPerBlock / 32;
   constexpr int kCandidatesPerThread =
       (kNumFinalItems + kNumThreadsPerBlock - 1) / kNumThreadsPerBlock;
@@ -951,12 +992,25 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   uint32_t logitPattern = 0;
 
   // ---- Stage 0: fp16 10-bit hist -----------------------------------------
-  bool continueToNextStep =
-      processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
-          logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
-          smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-          force_begin, force_end_start, row_num_valid_pages);
+  bool continueToNextStep = false;
+  if (kPrefill && rowLen <= kNumFinalItems) {
+    if (threadIdx.x < rowLen) {
+      smemFinal.items.logits[threadIdx.x] =
+          IsForcedBlock(threadIdx.x, force_begin, force_end_start, row_num_valid_pages)
+              ? FLT_MAX : logits[threadIdx.x];
+      smemFinal.items.indices[threadIdx.x] = threadIdx.x;
+    }
+    if (threadIdx.x == 0) smemFinalDstIdx[0] = rowLen;
+    __syncthreads();
+  } else {
+    continueToNextStep =
+        processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
+            logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
+            smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
+            force_begin, force_end_start, row_num_valid_pages);
+  }
 
+  const int coarseThreshold = thresholdBinIdx;
   if (continueToNextStep) {
     // Stage 1: fp32 high 10 bits.
     continueToNextStep =
@@ -971,15 +1025,23 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
         processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
             smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-            force_begin, force_end_start, row_num_valid_pages);
+            force_begin, force_end_start, row_num_valid_pages, coarseThreshold);
   }
   if (continueToNextStep) {
-    // Stage 3: fp32 low 10 bits.  After this step every remaining tie shares
-    // the same 32-bit pattern so we just fill the topk window directly.
-    processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
+    // Prefill refines the final two fp32 bits if this bin still overflows.
+    const bool overflow = processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
         logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
         smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-        force_begin, force_end_start, row_num_valid_pages);
+        force_begin, force_end_start, row_num_valid_pages, coarseThreshold);
+    if constexpr (kPrefill) {
+      continueToNextStep = overflow;
+      if (overflow) {
+        processHistogramStep<4, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
+            logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
+            smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
+            force_begin, force_end_start, row_num_valid_pages, coarseThreshold);
+      }
+    }
   }
 
   if (!continueToNextStep) {
@@ -994,7 +1056,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     const int selectionLane = threadIdx.x & 31;
     const int selectionWarp = threadIdx.x >> 5;
 
-    if (finalCount <= kIndexerQuadraticSelectionLimit) {
+    if (!kPrefill && finalCount <= kIndexerQuadraticSelectionLimit) {
       for (int i = threadIdx.x; i < finalCount; i += kNumThreadsPerBlock) {
         int outIndex = 0;
         const float logit = smemFinal.items.logits[i];
@@ -1066,7 +1128,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
 
   // ---- v2.1 warp-only fused asc-by-index sort -----------------------------
   // After final-candidate selection fills smemOutput[0..topk-1] (unsorted by index),
-  // only warp 0 (32 lanes) participates in the sort.  Other 480 threads idle.
+  // only warp 0 (32 lanes) participates in the sort.  Other threads idle.
   //
   // Why warp-only vs cub::BlockRadixSort<512, 1>:
   //   - cub::BlockRadixSort<uint32_t, 512, 1>.Sort() processes ALL 512 thread
@@ -1209,7 +1271,7 @@ cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
                   (void*)&force_begin, (void*)&force_end, (void*)&input_qo_outermost_u32,
                   (void*)&use_pdl, (void*)&publish};
   dim3 grid(num_rows);
-  dim3 block(kIndexerNumThreadsPerBlock);
+  dim3 block(std::is_same_v<Publisher, SparseTopKPrefill> ? 128 : kIndexerNumThreadsPerBlock);
   return LaunchSparseTopKKernel((const void*)kernel, grid, block, args, dyn_smem_bytes,
                                 stream, enable_pdl);
 }

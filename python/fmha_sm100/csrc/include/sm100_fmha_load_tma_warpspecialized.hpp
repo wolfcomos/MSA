@@ -105,16 +105,30 @@ struct Sm100FmhaLoadTmaWarpspecialized {
                 "MSA_NVFP4_KV_MODE >= 2 requires the paged KV path (KVPageSize > 0); the "
                 "non-paged load lambdas do not write a k2::StageTag.");
 
-  // Rank r of W owns interleaved rows r + W*j of each B128 page.
-  // kv_len is the exact global length. packed_rank_c = r * 16 + W.
-  CUTLASS_DEVICE static int icp_local_blocks_exact(int kv_len, int packed_rank_c) {
+  // P128 is interleaved; P256 assigns each rank a contiguous B128 fragment.
+  CUTLASS_DEVICE static int icp_global_row(int local_row, int packed_rank_c) {
     int W = packed_rank_c & 15;
     int r = packed_rank_c >> 4;
-    int R = KVPageSize;
-    int B = R * W;
-    int full = kv_len / B;
-    int rem = kv_len - full * B;
-    return full + ((rem > r) ? 1 : 0);
+    if constexpr (KVPageSize == 128) {
+      return (local_row / 128 * W + r) * 128 + local_row % 128;
+    } else {
+      return local_row * W + r;
+    }
+  }
+
+  CUTLASS_DEVICE static int icp_local_rows(int kv_len, int packed_rank_c) {
+    int W = packed_rank_c & 15;
+    int r = packed_rank_c >> 4;
+    if constexpr (KVPageSize == 128) {
+      int full = kv_len / (128 * W);
+      return full * 128 + max(0, min(128, kv_len % (128 * W) - r * 128));
+    } else {
+      return max(0, (kv_len + W - 1 - r) / W);
+    }
+  }
+
+  CUTLASS_DEVICE static int icp_local_blocks_exact(int kv_len, int packed_rank_c) {
+    return (icp_local_rows(kv_len, packed_rank_c) + KVPageSize - 1) / KVPageSize;
   }
 
   // Local KV tiles of a causal ICP work item; floored at 1 so mma()'s prologue cannot hang.
@@ -123,12 +137,10 @@ struct Sm100FmhaLoadTmaWarpspecialized {
                                                 ProblemShape const& problem_shape,
                                                 int kv_block_num) {
     constexpr int full_tile_kv = get<1>(TileShape{});
-    int C = kv_block_num & 15;
-    int r = kv_block_num >> 4;
-    int local_avail = max(0, (int(get<1>(problem_shape)) + C - 1 - r) / C);
+    int local_avail = icp_local_rows(int(get<1>(problem_shape)), kv_block_num);
     int offset_q = Mask::get_qo_offset(problem_shape);
     int q_end = (int(get<0>(blk_coord)) + 1) * int(get<0>(TileShape{}));
-    int local_causal = max(0, (q_end + offset_q + C - 1 - r) / C);
+    int local_causal = icp_local_rows(q_end + offset_q, kv_block_num);
     int local_rows = min(local_avail, local_causal);
     return max(1, (local_rows + full_tile_kv - 1) / full_tile_kv);
   }

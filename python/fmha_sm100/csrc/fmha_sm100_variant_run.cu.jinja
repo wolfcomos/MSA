@@ -201,8 +201,9 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
                             ? static_cast<int>(maybe_kv_block_indexes.value().size(2))
                             : 0;{% if sparse_mode == "OnlyScoreIcp" %}
   // OnlyScoreIcp: kv_indices is the block table; rank and world size ride kv_block_num.
-  TVM_FFI_ICHECK(icp_c == 2 && icp_rank >= 0 && icp_rank < icp_c && page_size * icp_c == 128)
-      << "OnlyScoreIcp serves TP2 64-row fragments; got icp_c=" << icp_c
+  TVM_FFI_ICHECK(icp_c == 2 && icp_rank >= 0 && icp_rank < icp_c
+                 && page_size == {{ page_size }} && (page_size == 64 || page_size == 128))
+      << "OnlyScoreIcp serves TP2 64/128-row fragments; got icp_c=" << icp_c
       << " icp_rank=" << icp_rank << " page_size=" << page_size;
   params.kv_block_num = static_cast<int>(icp_rank * 16 + icp_c);
   TVM_FFI_ICHECK(maybe_kv_indices.has_value() && !maybe_kv_page_indptr.has_value()

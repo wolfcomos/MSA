@@ -298,13 +298,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         : ( (get<0>(ThreadShape{}) == 1) ? 4 : 2 );
       // (StageCountKV_dynamic > StageCountKV_base) ? StageCountKV_dynamic : StageCountKV_base;
 
-  // The OnlyScoreIcp prefill scorer (IcpPrefillMask) runs a 16-deep K ring.
+  // Keep 128 KiB of K payload for either ICP page size.
   static constexpr int StageCountKV_prefill = kv_stage_count_of<Mask_>::value
       ? kv_stage_count_of<Mask_>::value : StageCountKV_shipped;
   static_assert(kv_stage_count_of<Mask_>::value == 0 ||
-                (kNeedIcp && !IsSplitKV && sizeof(Element_) == 1 && KVPageSize == 64
+                (kNeedIcp && !IsSplitKV && sizeof(Element_) == 1
+                 && (KVPageSize == 64 || KVPageSize == 128)
                  && get<0>(ThreadShape{}) == 1 && get<1>(ThreadShape{}) == 2),
-                "the deep K ring is restricted to the OnlyScoreIcp FP8 page-64 prefill scorer");
+                "the deep K ring is restricted to the OnlyScoreIcp FP8 prefill scorer");
 
   static constexpr bool kDequantProducesKV = k2::kDequantProducesKV;
   static constexpr int StageCountKV =
@@ -1078,13 +1079,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         copy(tiled_tmem_load, l_tTMEM_LOADtS, tTMEM_LOADrS);
         if constexpr (need_apply_mask) {
           if constexpr (kNeedIcp) {
-            const int C = icp_c_of(params.load.kv_block_num);
-            const int r = icp_rank_of(params.load.kv_block_num);
             const int offset_q = Mask::get_qo_offset(problem_shape);
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < size(tTMEM_LOADrS); ++i) {
               auto pos = tTMEM_LOADcS(i);
-              int global_k = int(get<1>(pos)) * C + r;
+              int global_k = Load::icp_global_row(int(get<1>(pos)), params.load.kv_block_num);
               if (global_k >= int(get<1>(problem_shape)) ||
                   global_k > int(get<0>(pos)) + offset_q) {
                 tTMEM_LOADrS(i) = -INFINITY;
@@ -1141,7 +1140,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       if constexpr (kFuseMaxScoreIntoSoftmax) {
         // K-split stage 1 starts one tile past an odd tile count; ICP rows hold max_k_tiles.
         bool in_row = true;
-        if constexpr (kNeedIcp) in_row = k_tile_idx < params.load.icp.max_k_tiles;
+        if constexpr (kNeedIcp) {
+          int block = Load::icp_global_row(k_tile_idx * KVPageSize, params.load.kv_block_num) / 128;
+          in_row = block < params.load.icp.max_k_tiles;
+        }
         if (ms_base != nullptr && in_row) {
 #ifdef FMHA_GMEM_BOUNDS_CHECK
           gmem_stwt_checked(ms_base + k_tile_idx * ms_stride_k, tile_max,
@@ -1432,7 +1434,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         sparse_tile_counter++;
         int pos;
         if constexpr (kNeedIcp) {
-          // Keep local row coordinates; the causal mask restores r + C*j.
+          // The causal mask maps these local rows to global token positions.
           int nloc = Load::icp_local_blocks_exact(int(get<1>(problem_shape)), params.load.kv_block_num);
           if (int(page_idx) >= nloc) {
             cS = domain_offset(make_coord(q_s, INT_MAX / 4), cS_base);
@@ -1455,8 +1457,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         int causal_bound = Mask{}.sparse_causal_bound(q_s, problem_shape);
         constexpr int sub_tile_kv = get<1>(TileShapeQK{});
         if constexpr (kNeedIcp) {
-          return (kv_coord + sub_tile_kv - 1) * icp_c_of(params.load.kv_block_num)
-                     + icp_rank_of(params.load.kv_block_num) <= causal_bound;
+          return Load::icp_global_row(kv_coord + sub_tile_kv - 1, params.load.kv_block_num)
+                     <= causal_bound;
         } else {
           return kv_coord + sub_tile_kv <= causal_bound + 1;
         }
@@ -1533,6 +1535,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
           }
         } else {
           packed_maxscore_path();
+        }
+        if constexpr (kNeedIcp && KVPageSize == 128) {
+          ms_base += icp_rank_of(params.load.kv_block_num) * ms_stride_k;
+          ms_stride_k *= icp_c_of(params.load.kv_block_num);
         }
       }
 

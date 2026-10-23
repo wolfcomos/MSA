@@ -640,6 +640,13 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
+        if constexpr (CollectiveMainloop::kNeedIcp && CollectiveMainloop::KVPageSize == 64
+                      && !IsSplitKV) {
+          static_assert(NumWarpsCorrection == 4);
+          mainloop.complete_icp_score_rows(blk_coord, params.mainloop, logical_problem_shape,
+                                           params.problem_shape, epilogue);
+        }
+
         if (is_empty_work(logical_problem_shape, params)) {
           mainloop.correction_empty(blk_coord, params.mainloop, logical_problem_shape,
                                     params.problem_shape, shared_storage.epilogue,

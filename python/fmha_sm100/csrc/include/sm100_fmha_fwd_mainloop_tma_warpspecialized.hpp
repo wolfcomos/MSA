@@ -2412,6 +2412,35 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     RELEASE_GPU_TRACE;
   }
 
+  template <class BlkCoord, class ProblemShape, class ParamsProblemShape, class CollectiveEpilogue>
+  CUTLASS_DEVICE void complete_icp_score_rows(
+      BlkCoord const& blk_coord, Params const& params, ProblemShape const& problem_shape,
+      ParamsProblemShape const& params_problem_shape, CollectiveEpilogue const& epilogue) {
+    constexpr int kColumnsPerTrip = get<1>(ThreadShape{});
+    int covered = Load::icp_local_blocks_exact(int(get<1>(problem_shape)),
+                                              params.load.kv_block_num) == 0
+                      ? 0 : get_full_trip_count(blk_coord, problem_shape,
+                                                params.load.kv_block_num) * kColumnsPerTrip;
+    int begin = int(get<0>(blk_coord)) * int(get<0>(TileShape{}));
+    int end = min(begin + int(get<0>(TileShape{})), int(get<0>(problem_shape)));
+    int offset = Mask::get_qo_offset(problem_shape);
+    int last = min(int(get<1>(problem_shape)), offset + end);
+    if (covered >= (last + 127) / 128) return;
+    int batch_idx = get<2, 1>(blk_coord);
+    int segment_offset = SEG_OFF_LOAD(get<0>(params_problem_shape), batch_idx,
+                                      get<3, 1>(params_problem_shape) + 1);
+    Tensor scores = make_tensor(make_gmem_ptr(epilogue.params.ptr_MaxScore),
+                                 epilogue.params.layout_MaxScore);
+    // These columns have no local K and are outside every softmax store.
+    for (int row = begin + threadIdx.x % 128; row < end; row += 128) {
+      int valid = min(int(get<1>(problem_shape)), offset + row + 1);
+      int columns = min((valid + 127) / 128, params.load.icp.max_k_tiles);
+      for (int column = covered; column < columns; ++column) {
+        scores(segment_offset + row, get<2, 0>(blk_coord), column) = -INFINITY;
+      }
+    }
+  }
+
   template <class BlkCoord, class ProblemShape, class ParamsProblemShape, class TensorStorageEpi,
             class CollectiveEpilogue>
   CUTLASS_DEVICE auto correction_empty(

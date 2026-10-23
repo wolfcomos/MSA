@@ -1,0 +1,165 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
+# SPDX-License-Identifier: MIT
+
+"""Uninitialized scratch must be safe within every query's causal score prefix."""
+
+import pytest
+import torch
+
+
+@pytest.mark.parametrize(
+    "query_lens,prefixes",
+    [
+        ([1], [0]),
+        ([1], [128]),
+        ([1], [256]),
+        ([1], [512]),
+        ([65], [0]),
+        ([257, 1], [0, 128]),
+        ([0, 65, 0, 3], [127, 194, 0, 127]),
+    ],
+)
+@pytest.mark.parametrize("device_plan", [False, True])
+@torch.inference_mode()
+def test_sharded_score_missing_columns(query_lens, prefixes, device_plan):
+    from fmha_sm100.api import (
+        _get_num_cta,
+        fmha_index_score_sharded,
+        fmha_index_score_sharded_plan,
+        fmha_index_score_sharded_plan_device,
+    )
+
+    torch.manual_seed(12)
+    device, heads, chunk = torch.device("cuda"), 4, 256
+    total_q = sum(query_lens)
+    lengths = [q + p for q, p in zip(query_lens, prefixes)]
+    pages = (max(lengths) + 127) // 128
+    table = torch.stack([torch.randperm(pages, device=device) for _ in lengths]).int()
+    table[:, 0] = table[0, 0].clone()
+    query = torch.randint(-2, 3, (total_q, heads, 128), device=device).to(
+        torch.float8_e4m3fn
+    )
+    query[..., 0] = 16
+    cache = torch.randint(-2, 3, (pages, 128, 128), device=device).to(query.dtype)
+    offsets = [0]
+    for length in query_lens:
+        offsets.append(offsets[-1] + length)
+    plans = []
+    for begin in range(0, total_q, chunk):
+        end = min(begin + chunk, total_q)
+        local_starts = [
+            min(q, max(0, begin - off)) for q, off in zip(query_lens, offsets)
+        ]
+        q_lens = [
+            max(0, min(end, off + q) - max(begin, off))
+            for q, off in zip(query_lens, offsets)
+        ]
+        starts = [p + s for p, s in zip(prefixes, local_starts)]
+        kv_lens = [s + q for s, q in zip(starts, q_lens)]
+        if device_plan:
+            q_meta, kv_meta, start_meta = [
+                torch.tensor(values, dtype=torch.int32, device=device)
+                for values in (q_lens, kv_lens, starts)
+            ]
+            q_offsets, kv_offsets = [
+                torch.cat((x.new_zeros(1), x.cumsum(0).int()))
+                for x in (q_meta, kv_meta)
+            ]
+            plan = fmha_index_score_sharded_plan_device(
+                q_meta,
+                kv_meta,
+                q_offsets,
+                kv_offsets,
+                start_meta,
+                heads,
+                total_q=end - begin,
+                max_query_len=max(q_lens),
+                max_seq_len=max(kv_lens),
+                packed_work_range=torch.empty(
+                    _get_num_cta(device), device=device, dtype=torch.int64
+                ),
+                packed_work_info=torch.empty(
+                    heads * ((end - begin + 127) // 128 + len(q_lens) - 1),
+                    device=device,
+                    dtype=torch.int64,
+                ),
+                workspace=torch.empty(32 << 20, device=device, dtype=torch.uint8),
+            )
+        else:
+            plan = fmha_index_score_sharded_plan(
+                torch.tensor(q_lens, dtype=torch.int32),
+                torch.tensor(kv_lens, dtype=torch.int32),
+                heads,
+                qo_offset=torch.tensor(starts, dtype=torch.int32),
+                device=device,
+            )
+        plans.append((begin, end, plan))
+
+    storage = torch.empty((min(chunk, total_q), heads, pages + 1), device=device)
+    positions = torch.cat(
+        [torch.arange(q, device=device) + p for q, p in zip(query_lens, prefixes)]
+    )
+    begin, end, plan = plans[0]
+    with pytest.raises(ValueError, match="query shape"):
+        fmha_index_score_sharded(
+            query[begin:end],
+            cache[:, ::2].contiguous(),
+            table,
+            {**plan, "num_kv_splits": 2},
+            rank=0,
+            max_score=storage[: end - begin, :, :pages],
+            sm_scale=1.0,
+            initialize=False,
+        )
+    for poison in (float("nan"), float("inf")):
+        query = (-query.float()).to(query.dtype)
+        for req, length in enumerate(lengths):
+            if length:
+                page, tail = table[req, (length - 1) // 128], (length - 1) % 128
+                cache[page, tail:] = 0
+                cache[page, tail:, 0] = 256
+        for rank in range(2):
+            shard = cache[:, rank::2].contiguous()
+            reference = torch.full(
+                (total_q, heads, pages), -float("inf"), device=device
+            )
+            for req, q_len in enumerate(query_lens):
+                if q_len == 0:
+                    continue
+                q = query[offsets[req] : offsets[req + 1]].float()
+                keys = shard[table[req]].float().reshape(-1, 128)
+                dots = torch.einsum("qhd,kd->qhk", q, keys)
+                key_pos = torch.arange(rank, pages * 128, 2, device=device)
+                causal = positions[offsets[req] : offsets[req + 1]]
+                dots.masked_fill_(
+                    key_pos[None, None, :] > causal[:, None, None], -float("inf")
+                )
+                reference[offsets[req] : offsets[req + 1]] = dots.reshape(
+                    q_len, heads, pages, 64
+                ).amax(-1)
+            for begin, end, plan in plans:
+                storage.fill_(poison)
+                scores = storage[: end - begin, :, :pages]
+                fmha_index_score_sharded(
+                    query[begin:end],
+                    shard,
+                    table,
+                    plan,
+                    rank=rank,
+                    max_score=scores,
+                    sm_scale=1.0,
+                    initialize=False,
+                )
+                valid = positions[begin:end] // 128 + 1
+                mask = (torch.arange(pages, device=device)[None, :] < valid[:, None])[
+                    :, None, :
+                ].expand_as(scores)
+                torch.testing.assert_close(
+                    scores[mask], reference[begin:end][mask], rtol=0, atol=0
+                )
+                if poison != poison:
+                    assert torch.isnan(storage[..., -1]).all()
+                    assert torch.isnan(storage[end - begin :]).all()
+                else:
+                    assert torch.isposinf(storage[..., -1]).all()
+                    assert torch.isposinf(storage[end - begin :]).all()

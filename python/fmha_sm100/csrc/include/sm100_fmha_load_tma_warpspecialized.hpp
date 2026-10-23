@@ -76,6 +76,13 @@ struct MaskPackFactor { static constexpr int value = 1; };
 template <int P>
 struct MaskPackFactor<PackedCausalMask<P>> { static constexpr int value = P; };
 
+// OnlyScoreIcp score columns and direct block table passed as kv_indices.
+struct IcpParams {
+  int max_k_tiles = 0;
+  int block_table_row_stride = 0;
+  int block_table_row_begin = 0;
+};
+
 template <class Element, class CollectiveMmaQK, class CollectiveMmaPV, class SmemLayoutQ,
           class SmemLayoutK, class SmemLayoutV, class TensorStorage, class PipelineQ,
           class PipelineKV, class Mask, class TileShape, int KVPageSize = -1,
@@ -84,7 +91,8 @@ struct Sm100FmhaLoadTmaWarpspecialized {
   // P0: OnlyScore mode never reads V — skip every V slot in the KV pipeline.
   // mma() gates the matching wait_V/release_V under `kNeedOutput` so producer
   // (loader) and consumer (mma) stay step-locked on the pipeline state.
-  static constexpr bool kNeedV = (kSparseAttnMode != SparseAttnMode::OnlyScore);
+  static constexpr bool kNeedIcp = (kSparseAttnMode == SparseAttnMode::OnlyScoreIcp);
+  static constexpr bool kNeedV = (kSparseAttnMode != SparseAttnMode::OnlyScore) && !kNeedIcp;
 
   using TileShapeQK = typename CollectiveMmaQK::TileShape;
   using TileShapePV = typename CollectiveMmaPV::TileShape;
@@ -96,6 +104,34 @@ struct Sm100FmhaLoadTmaWarpspecialized {
   static_assert(!k2::kDequantProducesKV || (KVPageSize > 0),
                 "MSA_NVFP4_KV_MODE >= 2 requires the paged KV path (KVPageSize > 0); the "
                 "non-paged load lambdas do not write a k2::StageTag.");
+
+  // Rank r of W owns interleaved rows r + W*j of each B128 page.
+  // kv_len is the exact global length. packed_rank_c = r * 16 + W.
+  CUTLASS_DEVICE static int icp_local_blocks_exact(int kv_len, int packed_rank_c) {
+    int W = packed_rank_c & 15;
+    int r = packed_rank_c >> 4;
+    int R = KVPageSize;
+    int B = R * W;
+    int full = kv_len / B;
+    int rem = kv_len - full * B;
+    return full + ((rem > r) ? 1 : 0);
+  }
+
+  // Local KV tiles of a causal ICP work item; floored at 1 so mma()'s prologue cannot hang.
+  template <class BlkCoord, class ProblemShape>
+  CUTLASS_DEVICE static int icp_full_trip_count(BlkCoord const& blk_coord,
+                                                ProblemShape const& problem_shape,
+                                                int kv_block_num) {
+    constexpr int full_tile_kv = get<1>(TileShape{});
+    int C = kv_block_num & 15;
+    int r = kv_block_num >> 4;
+    int local_avail = max(0, (int(get<1>(problem_shape)) + C - 1 - r) / C);
+    int offset_q = Mask::get_qo_offset(problem_shape);
+    int q_end = (int(get<0>(blk_coord)) + 1) * int(get<0>(TileShape{}));
+    int local_causal = max(0, (q_end + offset_q + C - 1 - r) / C);
+    int local_rows = min(local_avail, local_causal);
+    return max(1, (local_rows + full_tile_kv - 1) / full_tile_kv);
+  }
 
   template <class BlkCoord, class ProblemShape, class ParamsT>
   CUTLASS_DEVICE static int compute_effective_end(BlkCoord const& blk_coord,
@@ -109,6 +145,8 @@ struct Sm100FmhaLoadTmaWarpspecialized {
       valid_sparse_blocks = min(valid_sparse_blocks, params.kv_block_num);
       valid_sparse_blocks = max(valid_sparse_blocks, 1);
       full_trip = (valid_sparse_blocks * KVPageSize + full_tile_kv - 1) / full_tile_kv;
+    } else if constexpr (kNeedIcp) {
+      full_trip = icp_full_trip_count(blk_coord, problem_shape, params.kv_block_num);
     } else {
       full_trip = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
     }
@@ -187,6 +225,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
 #if MSA_NVFP4_KV_MODE >= 3
     k2::Nvfp4KvViews nvfp4_kv{};
 #endif
+    IcpParams icp{};
   };
 
   // using ShapeLseT = cute::Shape<int32_t, int32_t>;
@@ -203,7 +242,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
   static constexpr int kPackFactor = MaskPackFactor<Mask>::value;
   static constexpr bool kEnablePackedQTMA = (kPackFactor > 1) && ((kPackFactor & (kPackFactor - 1)) == 0);
 
-  struct Params {
+  struct ParamsBase {
     TMA_Q tma_load_Q;
     LayoutQ layout_Q;
     TMA_K tma_load_K;
@@ -228,6 +267,10 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     k2::Nvfp4KvViews nvfp4_kv{};
 #endif
   };
+  struct ParamsIcp : ParamsBase {
+    IcpParams icp;
+  };
+  using Params = std::conditional_t<kNeedIcp, ParamsIcp, ParamsBase>;
 
   template <class ProblemShape>
   static Params to_underlying_arguments(ProblemShape const& problem_shape, Arguments const& args,
@@ -285,7 +328,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
           CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     }
 
-    Params p{tma_load_Q, layout_Q, tma_load_K, layout_K, tma_load_V, layout_V,
+    ParamsBase p{tma_load_Q, layout_Q, tma_load_K, layout_K, tma_load_V, layout_V,
                   args.kv_indices, args.kv_page_indptr, args.kv_block_indexes, args.kv_block_num,
 #ifdef FMHA_GMEM_BOUNDS_CHECK
                   args.kv_page_indptr_size, args.kv_indices_size, args.kv_block_indexes_numel,
@@ -295,7 +338,11 @@ struct Sm100FmhaLoadTmaWarpspecialized {
 #if MSA_NVFP4_KV_MODE >= 3
     p.nvfp4_kv = args.nvfp4_kv;
 #endif
-    return p;
+    if constexpr (kNeedIcp) {
+      return Params{p, args.icp};
+    } else {
+      return p;
+    }
   }
 
   CUTLASS_DEVICE
@@ -583,9 +630,17 @@ struct Sm100FmhaLoadTmaWarpspecialized {
 
       int h_r = get<3, 0, 0>(params_problem_shape);
       int kv_head_idx = qo_head_idx / h_r;
-      int kv_page_start = KV_INDPTR_LOAD(params.kv_page_indptr, batch_idx, params.kv_page_indptr_size);
+      int kv_page_start;
       int num_pages_batch = 0;
-      if constexpr (kSparseAttnMode != SparseAttnMode::Sparse) {
+      if constexpr (kNeedIcp) {
+        // kv_indices is the block table; the live bound comes from the exact kv_len.
+        kv_page_start = (params.icp.block_table_row_begin + batch_idx)
+                      * params.icp.block_table_row_stride;
+        num_pages_batch = icp_local_blocks_exact(kv_len, params.kv_block_num);
+      } else {
+        kv_page_start = KV_INDPTR_LOAD(params.kv_page_indptr, batch_idx, params.kv_page_indptr_size);
+      }
+      if constexpr (kSparseAttnMode != SparseAttnMode::Sparse && !kNeedIcp) {
         int kv_page_end = KV_INDPTR_LOAD(params.kv_page_indptr, batch_idx + 1, params.kv_page_indptr_size);
         num_pages_batch = kv_page_end - kv_page_start;
       }

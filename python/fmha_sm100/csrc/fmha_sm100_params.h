@@ -86,6 +86,10 @@ struct FMHACutlassSM100Params {
   const float* nvfp4_v_global_scale = nullptr;
 
   GMEM_BOUNDS_FIELD
+
+  // OnlyScoreIcp: the direct block table's row pitch/origin.
+  int icp_block_table_row_stride = 0;
+  int icp_block_table_row_begin = 0;
 };
 
 using FMHAVariantFn = cudaError_t (*)(const FMHACutlassSM100Params&);

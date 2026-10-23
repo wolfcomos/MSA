@@ -1546,12 +1546,13 @@ def fmha_index_score_sharded_plan(qo_segment_lens, kv_segment_lens, num_qo_heads
 
 
 def fmha_index_score_sharded(q, k, block_table, plan_info, *, rank,
-                             max_score, sm_scale):
+                             max_score, sm_scale, initialize=True):
     """Score interleaved TP2/P128 index K into bounded [T,H,B128] buffers.
 
     q is FP8 [T,H,128], k is FP8 [pages,64,128], and block_table contains
     physical P128 page IDs. The caller supplies float32 max_score scratch;
-    this function initializes all columns to -inf before scoring visible blocks.
+    with initialize=False, only the causal prefix of each row is defined.
+    Readers must restrict access to that query's valid page count.
     Scores are raw QK maxima, matching the ordinary OnlyScore path.
     """
     if rank not in (0, 1):
@@ -1579,7 +1580,8 @@ def fmha_index_score_sharded(q, k, block_table, plan_info, *, rank,
     max_qo_len = plan_info["max_qo_len"]
     variant = get_fmha_variant(_dlpack_dtype_code(q.dtype), 128, max_qo_len <= 64,
                               4, 64, False, 1)
-    max_score.fill_(float("-inf"))
+    if initialize:
+        max_score.fill_(float("-inf"))
     variant.run(
         plan_info["cute_workspace_buffer"], q, k_pages, k_pages,
         plan_info["qo_segment_lens"], plan_info["kv_segment_lens"],

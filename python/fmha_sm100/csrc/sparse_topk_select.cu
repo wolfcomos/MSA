@@ -210,6 +210,41 @@ void sparse_topk_select_publish(TensorView scores, TensorView num_valid_pages,
       << "sparse_topk_select_publish failed: " << cudaGetErrorString(status);
 }
 
+void sparse_topk_select_prefill(TensorView scores, TensorView num_valid_pages,
+                               TensorView carrier, int64_t force_begin,
+                               int64_t force_end, int64_t stream_ptr) {
+  CHECK_INPUT(scores);
+  CHECK_INPUT(num_valid_pages);
+  CHECK_CUDA(carrier);
+  CHECK_DIM(3, scores);
+  CHECK_DIM(1, num_valid_pages);
+  CHECK_DIM(3, carrier);
+  CHECK_DEVICE(scores, num_valid_pages);
+  CHECK_DEVICE(scores, carrier);
+  TVM_FFI_ICHECK(encode_dlpack_dtype(scores.dtype()) == float32_code);
+  TVM_FFI_ICHECK(encode_dlpack_dtype(num_valid_pages.dtype()) == int32_code);
+  TVM_FFI_ICHECK(encode_dlpack_dtype(carrier.dtype()) == int32_code);
+  TVM_FFI_ICHECK(scores.size(1) > 0 && scores.size(2) > 0 && scores.size(2) < 12288);
+  TVM_FFI_ICHECK(num_valid_pages.size(0) == scores.size(0));
+  TVM_FFI_ICHECK(carrier.size(0) == scores.size(1) &&
+                carrier.size(1) == scores.size(0) && carrier.size(2) == 33);
+  TVM_FFI_ICHECK(carrier.stride(2) == 1 && carrier.stride(1) >= 33 &&
+                carrier.stride(0) >= carrier.size(1) * carrier.stride(1));
+  TVM_FFI_ICHECK(force_begin >= 0 && force_end >= 0 && force_begin + force_end <= 16);
+  sparse_topk::SparseTopKPrefill publish{
+      TensorDataPtr<int32_t>(carrier), static_cast<uint64_t>(carrier.stride(0)),
+      static_cast<uint64_t>(carrier.stride(1))};
+  const cudaError_t status = sparse_topk::LaunchIndexerTopK<true>(
+      TensorDataPtrConst<float>(scores), nullptr, nullptr,
+      0, 0, 0, 0, 0, 0, scores.size(0), scores.size(1), scores.size(2), 16,
+      scores.size(2), TensorDataPtrConst<int32_t>(num_valid_pages),
+      force_begin, force_end, /*input_qo_outermost=*/true,
+      reinterpret_cast<cudaStream_t>(stream_ptr), /*enable_pdl=*/false, publish);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "sparse_topk_select_prefill failed: " << cudaGetErrorString(status);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_select_prefill, sparse_topk_select_prefill);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_select_publish, sparse_topk_select_publish);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_select_init, sparse_topk_select_init);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_select, sparse_topk_select);

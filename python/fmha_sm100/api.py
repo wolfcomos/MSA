@@ -12,7 +12,8 @@ import math
 from typing import Optional, Tuple, Union
 
 __all__ = [
-    "fmha_sm100_plan", "fmha_sm100", "sparse_topk_select", "nvfp4_head_slot_views",
+    "fmha_sm100_plan", "fmha_sm100", "sparse_topk_select", "sparse_topk_select_prefill",
+    "nvfp4_head_slot_views",
     "fmha_index_score_sharded_plan", "fmha_index_score_sharded",
     "_fmha_sm100_plan", "_fmha_sm100",
 ]
@@ -1511,6 +1512,23 @@ def sparse_topk_select(
     )
 
     return output_indices
+
+
+def sparse_topk_select_prefill(scores, num_valid_pages, carrier, *,
+                             force_begin_blocks=0, force_end_blocks=0):
+    """Write local Top16 into a caller-owned int32 [H,T,33] candidate carrier.
+
+    Scores are contiguous float32 [T,H,K], with int32 valid counts [T]. The
+    carrier can be a head-major query-chunk view: its final stride must be one.
+    Rows contain raw score bits, ascending logical IDs, and a ready marker of
+    one; padding uses -inf/-1. Cutoff ties follow sparse_topk_select semantics.
+    The caller orders subsequent collective access on this CUDA stream.
+    """
+    get_sparse_topk_module().sparse_topk_select_prefill(
+        scores, num_valid_pages, carrier,
+        int(force_begin_blocks), int(force_end_blocks),
+        torch.cuda.current_stream().cuda_stream,
+    )
 
 
 def fmha_index_score_sharded_plan(qo_segment_lens, kv_segment_lens, num_qo_heads,

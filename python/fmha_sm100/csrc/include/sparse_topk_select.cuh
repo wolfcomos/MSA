@@ -761,7 +761,23 @@ struct SparseTopKPublish {
   }
 };
 
-template <uint32_t MAX_TOPK, bool PUBLISH = false>
+struct SparseTopKPrefill {
+  int32_t* carrier;
+  uint64_t stride_h, stride_t;
+
+  __device__ void operator()(uint32_t token, uint32_t head, const float* scores,
+                            int32_t id) const {
+    const uint32_t lane = threadIdx.x & 31;
+    int32_t* row = carrier + head * stride_h + token * stride_t;
+    if (lane < 16) {
+      row[lane] = __float_as_int(id >= 0 ? scores[id] : -CUDART_INF_F);
+      row[16 + lane] = id;
+    }
+    if (lane == 0) row[32] = 1;
+  }
+};
+
+template <uint32_t MAX_TOPK, bool PUBLISH = false, typename Publisher = SparseTopKPublish>
 __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSortKernel(
     const float* __restrict__ in,        // row-contig fp32: (H, T, K) or (T, H, K)
     int32_t* __restrict__ out,           // (qo, num_qo_heads, topk) logical int32
@@ -778,7 +794,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     uint32_t num_valid_pages,
     const int32_t* __restrict__ num_valid_pages_per_token,
     uint32_t force_begin, uint32_t force_end,
-    uint32_t input_qo_outermost, uint32_t use_pdl, SparseTopKPublish publish) {
+    uint32_t input_qo_outermost, uint32_t use_pdl, Publisher publish) {
   static_assert(!PUBLISH || MAX_TOPK == 16);
   static_assert(MAX_TOPK <= kSparseTopkMaxK, "MAX_TOPK exceeds supported max");
 
@@ -1160,7 +1176,7 @@ inline cudaError_t LaunchSparseTopKKernel(const void* kernel, dim3 grid, dim3 bl
 #endif
 }
 
-template <bool PUBLISH = false>
+template <bool PUBLISH = false, typename Publisher = SparseTopKPublish>
 cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
                               const int32_t* block_table,
                               uint64_t out_stride_t, uint64_t out_stride_h,
@@ -1175,11 +1191,11 @@ cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
                               uint32_t force_begin, uint32_t force_end,
                               bool input_qo_outermost,
                               cudaStream_t stream, bool enable_pdl,
-                              SparseTopKPublish publish = {}) {
+                              Publisher publish = {}) {
   const uint32_t num_rows = total_qo_len * num_qo_heads;
   if (num_rows == 0) return cudaSuccess;
 
-  auto kernel = IndexerTopKWithSortKernel<16, PUBLISH>;
+  auto kernel = IndexerTopKWithSortKernel<16, PUBLISH, Publisher>;
   const size_t dyn_smem_bytes = static_cast<size_t>(topk) * sizeof(int32_t);
   const uint32_t input_qo_outermost_u32 = input_qo_outermost ? 1u : 0u;
   const uint32_t use_pdl = enable_pdl ? 1u : 0u;

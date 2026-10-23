@@ -1068,7 +1068,7 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
             smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
             force_begin, force_end_start, row_num_valid_pages, coarseThreshold,
-        cachedLogits, cachedBins);
+            cachedLogits, cachedBins);
   }
   if (continueToNextStep) {
     // Compact selection refines the final two fp32 bits if this bin still overflows.
@@ -1084,7 +1084,7 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
             smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
             force_begin, force_end_start, row_num_valid_pages, coarseThreshold,
-        cachedLogits, cachedBins);
+            cachedLogits, cachedBins);
       }
     }
   }

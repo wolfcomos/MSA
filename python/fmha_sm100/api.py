@@ -14,7 +14,8 @@ from typing import Optional, Tuple, Union
 __all__ = [
     "fmha_sm100_plan", "fmha_sm100", "sparse_topk_select", "sparse_topk_select_prefill",
     "nvfp4_head_slot_views",
-    "fmha_index_score_sharded_plan", "fmha_index_score_sharded",
+    "fmha_index_score_sharded_plan", "fmha_index_score_sharded_plan_device",
+    "fmha_index_score_sharded",
     "_fmha_sm100_plan", "_fmha_sm100",
 ]
 
@@ -1542,6 +1543,58 @@ def fmha_index_score_sharded_plan(qo_segment_lens, kv_segment_lens, num_qo_heads
     )
     plan["index_score_sharded_shape"] = (int(qo_segment_lens.sum()), num_qo_heads)
     plan["index_score_sharded_columns"] = (int(kv_segment_lens.max()) + 127) // 128
+    return plan
+
+
+def fmha_index_score_sharded_plan_device(
+    qo_segment_lens, kv_segment_lens, qo_segment_offsets, kv_segment_offsets,
+    qo_offset, num_qo_heads, *, total_q, max_query_len, max_seq_len,
+    packed_work_range, packed_work_info, workspace,
+):
+    """Plan device-resident query segments into caller-owned reusable storage.
+
+    Lengths and offsets are int32 CUDA tensors. Host sizes are upper bounds;
+    no length value is copied to the host. Zero-length segments are allowed.
+    The caller keeps plan storage distinct for each concurrently live plan.
+    """
+    batch = qo_segment_lens.numel()
+    device = qo_segment_lens.device
+    for tensor, size in (
+        (qo_segment_lens, batch), (kv_segment_lens, batch),
+        (qo_segment_offsets, batch + 1), (kv_segment_offsets, batch + 1),
+        (qo_offset, batch),
+    ):
+        if (not tensor.is_cuda or tensor.device != device or tensor.dtype != torch.int32
+                or tensor.ndim != 1 or tensor.numel() != size or not tensor.is_contiguous()):
+            raise ValueError("expected contiguous int32 CUDA segment metadata")
+    if batch < 1 or total_q < 1 or not 0 < max_query_len <= total_q or max_seq_len < 1:
+        raise ValueError("invalid query/sequence bounds")
+    # sum(ceil(q_i / 128)) <= ceil(sum(q_i) / 128) + batch - 1.
+    work_items = ((total_q + 127) // 128 + batch - 1) * num_qo_heads
+    if (num_qo_heads < 1 or packed_work_info.numel() < work_items
+            or packed_work_range.numel() != _get_num_cta(device)):
+        raise ValueError("insufficient index-score plan storage")
+    for tensor in (packed_work_range, packed_work_info):
+        if (tensor.device != device or tensor.dtype != torch.int64
+                or tensor.ndim != 1 or not tensor.is_contiguous()):
+            raise ValueError("expected contiguous int64 CUDA work storage")
+    if (workspace.device != device or workspace.dtype != torch.uint8
+            or not workspace.is_contiguous() or workspace.numel() < 32 * 1024 * 1024):
+        raise ValueError("expected reusable FMHA workspace")
+    _call_plan(
+        qo_segment_offsets, qo_segment_lens, kv_segment_lens,
+        packed_work_range, packed_work_info, 128, 256, num_qo_heads,
+        packed_work_range.numel(), True, qo_offset, 1,
+        None, None, None, 0, None, None, None, 0, 1,
+    )
+    plan = _make_plan_info(
+        packed_work_range, packed_work_info, None, None, None, 1, None, None,
+        max_query_len, 1.0, None, qo_segment_offsets, kv_segment_offsets, None,
+        (max_seq_len + 127) // 128, qo_segment_lens, kv_segment_lens, qo_offset,
+        1, num_qo_heads, False, workspace,
+    )
+    plan["index_score_sharded_shape"] = (total_q, num_qo_heads)
+    plan["index_score_sharded_columns"] = (max_seq_len + 127) // 128
     return plan
 
 

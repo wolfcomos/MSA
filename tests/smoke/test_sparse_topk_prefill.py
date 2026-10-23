@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
-"""Compact prefill selection, including exact refinement and carrier reuse."""
+"""Compact selection and reuse; publisher peer windows are on one GPU."""
 
 import sys
 from pathlib import Path
@@ -12,6 +12,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from fmha_sm100 import sparse_topk_select_prefill
+from fmha_sm100.jit import get_sparse_topk_module
 
 
 @pytest.mark.parametrize(
@@ -21,6 +22,9 @@ from fmha_sm100 import sparse_topk_select_prefill
         (128, "unique"),
         (129, "unique"),
         (129, "tie"),
+        (1535, "cluster"),
+        (1536, "low_bits"),
+        (1537, "cross_bin"),
         (1600, "unique"),
         (1600, "cluster"),
         (1600, "low_bits"),
@@ -30,10 +34,11 @@ from fmha_sm100 import sparse_topk_select_prefill
     ],
 )
 @pytest.mark.parametrize("force_begin,force_end", [(0, 0), (2, 3)])
-def test_prefill_compact_selection(pages, mode, force_begin, force_end):
+@pytest.mark.parametrize("publish_world", [0, 2, 4])
+def test_prefill_compact_selection(pages, mode, force_begin, force_end, publish_world):
     width = pages + 31
     lengths = [0, 1, 15, 16, 17, 128, pages]
-    tokens, heads = len(lengths), 2
+    tokens, heads = len(lengths), 4
     scores = torch.empty((tokens, heads, width), device="cuda")
     valid = torch.empty(tokens, device="cuda", dtype=torch.int32)
     sentinel = 0x13131313
@@ -43,6 +48,23 @@ def test_prefill_compact_selection(pages, mode, force_begin, force_end):
     carrier = storage[:, 2 : 2 + 2 * tokens : 2, :33]
     guard = torch.ones_like(storage, dtype=torch.bool)
     guard[:, 2 : 2 + 2 * tokens : 2, :33] = False
+    if publish_world:
+        capacity, hpr = tokens + 2, heads // publish_world
+        windows = [
+            torch.zeros(
+                (3, publish_world, hpr, capacity, 32), device="cuda", dtype=torch.int64
+            )
+            for _ in range(publish_world)
+        ]
+        bases = torch.tensor(
+            [w.data_ptr() for w in windows], device="cuda", dtype=torch.int64
+        )
+        counters = [
+            torch.full((3, heads, capacity), -2, device="cuda", dtype=torch.int32)
+            for _ in range(publish_world)
+        ]
+        errors = torch.zeros(1, device="cuda", dtype=torch.int32)
+        publish = get_sparse_topk_module().sparse_topk_select_publish
     for reuse in range(2):
         current_lengths = lengths if reuse == 0 else lengths[::-1]
         source = torch.full((tokens, heads, width), float("nan"))
@@ -76,16 +98,55 @@ def test_prefill_compact_selection(pages, mode, force_begin, force_end):
             )
         scores.copy_(source)
         valid.copy_(torch.tensor(current_lengths, dtype=torch.int32))
-        sparse_topk_select_prefill(
-            scores,
-            valid,
-            carrier,
-            force_begin_blocks=force_begin,
-            force_end_blocks=force_end,
-        )
-        result = carrier.cpu().permute(1, 0, 2)
-        assert torch.all(storage[guard] == sentinel)
-        assert torch.all(result[..., 32] == 1)
+        if publish_world:
+            for rank in range(publish_world):
+                publish(
+                    scores,
+                    valid,
+                    bases,
+                    errors,
+                    0,
+                    rank,
+                    publish_world,
+                    hpr,
+                    capacity,
+                    force_begin,
+                    force_end,
+                    1 << 20,
+                    False,
+                    counters[rank],
+                    torch.cuda.current_stream().cuda_stream,
+                )
+            result = (
+                torch.cat(
+                    [
+                        w[0, :, :, :tokens].permute(2, 0, 1, 3).flatten(1, 2)
+                        for w in windows
+                    ],
+                    dim=1,
+                )
+                .to(torch.int32)
+                .cpu()
+            )
+            generation = 0xFFFFFFFF if reuse == 0 else 1
+            for owner, window in enumerate(windows):
+                assert torch.all(
+                    (window[0, :, :, :tokens] >> 32) & 0xFFFFFFFF == generation
+                )
+                assert torch.count_nonzero(window[1:]) == 0
+                assert torch.count_nonzero(window[0, :, :, tokens:]) == 0
+            assert errors.item() == 0
+        else:
+            sparse_topk_select_prefill(
+                scores,
+                valid,
+                carrier,
+                force_begin_blocks=force_begin,
+                force_end_blocks=force_end,
+            )
+            result = carrier.cpu().permute(1, 0, 2)
+            assert torch.all(storage[guard] == sentinel)
+            assert torch.all(result[..., 32] == 1)
         for token, count in enumerate(current_lengths):
             forced = set(range(min(force_begin, count))) | set(
                 range(max(0, count - force_end), count)
@@ -95,8 +156,14 @@ def test_prefill_compact_selection(pages, mode, force_begin, force_end):
             expected_scores = (
                 source[token, 0, ordinary].topk(quota).values.sort().values
             )
-            for head in range(heads):
-                ids = result[token, head, 16:32].tolist()
+            for output_head in range(result.shape[1]):
+                head = (
+                    output_head
+                    if not publish_world
+                    else (output_head // (publish_world * hpr)) * hpr
+                    + output_head % hpr
+                )
+                ids = result[token, output_head, 16:32].tolist()
                 live = ids[: min(16, count)]
                 assert live == sorted(set(live))
                 assert all(0 <= i < count for i in live)
@@ -114,4 +181,4 @@ def test_prefill_compact_selection(pages, mode, force_begin, force_end):
                     expected_bits[: len(live)] = source[token, head, live].view(
                         torch.int32
                     )
-                assert torch.equal(result[token, head, :16], expected_bits)
+                assert torch.equal(result[token, output_head, :16], expected_bits)

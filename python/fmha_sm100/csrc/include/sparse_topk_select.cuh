@@ -249,8 +249,26 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
                                      SmemFinalType& smemFinal, int rowStart, int topK,
                                      uint32_t force_begin, uint32_t force_end_start,
                                      uint32_t row_num_valid_pages,
-                                     int coarseThreshold = -1) {
-  constexpr bool kPrefill = kNumThreadsPerBlock == 128 && kNumFinalItems == 128;
+                                     int coarseThreshold = -1,
+                                     const float* cachedLogits = nullptr,
+                                     const uint32_t* cachedBins = nullptr) {
+  constexpr bool kCompact = kNumFinalItems == 128;
+  constexpr bool kCached = kCompact && kNumThreadsPerBlock == 512;
+  const bool cacheRow = kCached && rowEnd - rowStart <= 3 * kNumThreadsPerBlock;
+  auto visit = [&](auto process) {
+    if constexpr (kCached) {
+      if (cacheRow) {
+#pragma unroll
+        for (int item = 0; item < 3; ++item) {
+          const int idx = threadIdx.x + item * kNumThreadsPerBlock;
+          if (idx < rowEnd - rowStart) process(cachedLogits[item], idx);
+        }
+        return;
+      }
+    }
+    vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart,
+                       rowEnd - rowStart, process);
+  };
   // Clear the histogram.
 #pragma unroll
   for (int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock) {
@@ -276,7 +294,7 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
     if constexpr (step == 1) {
       return extractBinIdx<0>(logit) == static_cast<uint32_t>(prevThresholdBinIdx);
     } else {
-      if constexpr (kPrefill && step >= 2) {
+      if constexpr (kCompact && step >= 2) {
         if (extractBinIdx<0>(logit) != static_cast<uint32_t>(coarseThreshold)) return false;
       }
       return isPartialMatch<patternShift>(logit, logitPattern);
@@ -287,7 +305,10 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
     logit = effective_logit(logit, idx);
     if (matchesCurrentRefinement(logit)) {
       uint32_t binIdx = extractBinIdx<step>(logit);
-      if constexpr (kPrefill) {
+      if constexpr (kCached && step == 0) {
+        if (cacheRow) binIdx = cachedBins[idx / kNumThreadsPerBlock];
+      }
+      if constexpr (kCompact) {
         const unsigned peers = __match_any_sync(__activemask(), binIdx);
         if ((threadIdx.x & 31) == __ffs(peers) - 1) {
           atomicAdd(&smemFinal.histo.data[binIdx], __popc(peers));
@@ -299,15 +320,14 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
   };
 
   // Distribute the elements to the histogram bins.
-  vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart, rowEnd - rowStart,
-                     distributeToBins);
+  visit(distributeToBins);
   __syncthreads();
 
   // Reads the value of the starting position in smemOutput accounting.
   int lastValue = smemFoundTopKValues[0];
 
-  if constexpr (kPrefill) {
-    // Scan eight contiguous bins per thread with one block scan.
+  if constexpr (kCompact) {
+    // Scan contiguous bins per thread with one block scan.
     constexpr int kBinsPerThread = kNumBins / kNumThreadsPerBlock;
     const int base = threadIdx.x * kBinsPerThread;
     int counts[kBinsPerThread], sum = 0;
@@ -373,12 +393,15 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
     logit = effective_logit(logit, idx);
     if (matchesCurrentRefinement(logit)) {
       uint32_t binIdx = extractBinIdx<step>(logit);
+      if constexpr (kCached && step == 0) {
+        if (cacheRow) binIdx = cachedBins[idx / kNumThreadsPerBlock];
+      }
       if (binIdx < thresholdBinIdx) {
         // The element is part of the top-k selection.
         int dstIdx = atomicAdd(&smemFoundTopKValues[0], 1);
         smemOutput[dstIdx] = idx;
       }
-      if constexpr (step < (kPrefill ? 4 : 3)) {
+      if constexpr (step < (kCompact ? 4 : 3)) {
         // Only fill final items for sorting if the threshold bin fits.
         if (binIdx == thresholdBinIdx && smemFinalBinSize[0] <= kNumFinalItems) {
           int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
@@ -387,7 +410,7 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
         }
       } else {
         if (binIdx == thresholdBinIdx) {
-          // Prefill includes the final two bits before resolving exact ties.
+          // Include the final two bits before resolving exact ties.
           int dstIdx = atomicAdd(&smemFinal.histo.data[binIdx], 1);
           if (dstIdx < topK) {
             smemOutput[dstIdx] = idx;
@@ -397,8 +420,7 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
     }
   };
 
-  vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart, rowEnd - rowStart,
-                     processBins);
+  visit(processBins);
   __syncthreads();
 
   // Continue to next step if the threshold bin overflows the staging buffer.
@@ -841,12 +863,15 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
   constexpr bool kPrefill = std::is_same_v<Publisher, SparseTopKPrefill>;
   constexpr int kNumThreadsPerBlock = kPrefill ? 128 : kIndexerNumThreadsPerBlock;
   constexpr int kNumBins = kIndexerNumBins;
-  constexpr int kNumFinalItems = kPrefill ? 128 : kIndexerNumFinalItems;
+  constexpr bool kCompact = PUBLISH;
+  constexpr bool kCached = PUBLISH && !kPrefill;
+  constexpr int kNumFinalItems = kCompact ? 128 : kIndexerNumFinalItems;
   constexpr int kNumWarps = kNumThreadsPerBlock / 32;
   constexpr int kCandidatesPerThread =
       (kNumFinalItems + kNumThreadsPerBlock - 1) / kNumThreadsPerBlock;
+  constexpr int kSelectionWarps = kCompact ? 4 : kNumWarps;
   constexpr int kWarpCandidatesPerLane =
-      (kNumWarps * MAX_TOPK + 31) / 32;
+      (kSelectionWarps * MAX_TOPK + 31) / 32;
   static_assert(kNumThreadsPerBlock % 32 == 0);
   static_assert(kCandidatesPerThread * kNumThreadsPerBlock >= kNumFinalItems);
 
@@ -863,7 +888,7 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
     int data[kNumBins];
   };
   struct CandidateWarpSortStorage {
-    typename CandidateWarpSort::TempStorage warps[kNumWarps];
+    typename CandidateWarpSort::TempStorage warps[kSelectionWarps];
   };
 
   // SMEM union — v2.1 dropped the cub::BlockRadixSort sortByIndex member
@@ -883,7 +908,7 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
   __shared__ int smemFinalDstIdx[1];
   __shared__ int smemFinalBinSize[1];
   __shared__ int smemFoundTopKValues[1];
-  __shared__ uint64_t smemWarpTopCandidateKeys[kNumWarps * MAX_TOPK];
+  __shared__ uint64_t smemWarpTopCandidateKeys[kSelectionWarps * MAX_TOPK];
 
   // ---- bid -> row decode ---------------------------------------------------
   // HKT transpose path: bid = qo_head_idx * total_qo_len + t.
@@ -991,9 +1016,26 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
   int thresholdBinIdx = -1;
   uint32_t logitPattern = 0;
 
+  float cachedLogits[kCached ? 3 : 1];
+  uint32_t cachedBins[kCached ? 3 : 1];
+  if constexpr (kCached) {
+    if (rowLen <= 3 * kNumThreadsPerBlock) {
+#pragma unroll
+      for (int item = 0; item < 3; ++item) {
+        const int idx = threadIdx.x + item * kNumThreadsPerBlock;
+        if (idx < rowLen) {
+          cachedLogits[item] =
+              IsForcedBlock(idx, force_begin, force_end_start, row_num_valid_pages)
+                  ? FLT_MAX : logits[idx];
+          cachedBins[item] = extractBinIdx<0>(cachedLogits[item]);
+        }
+      }
+    }
+  }
+
   // ---- Stage 0: fp16 10-bit hist -----------------------------------------
   bool continueToNextStep = false;
-  if (kPrefill && rowLen <= kNumFinalItems) {
+  if (kCompact && rowLen <= kNumFinalItems) {
     if (threadIdx.x < rowLen) {
       smemFinal.items.logits[threadIdx.x] =
           IsForcedBlock(threadIdx.x, force_begin, force_end_start, row_num_valid_pages)
@@ -1007,7 +1049,7 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
         processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
             smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-            force_begin, force_end_start, row_num_valid_pages);
+            force_begin, force_end_start, row_num_valid_pages, -1, cachedLogits, cachedBins);
   }
 
   const int coarseThreshold = thresholdBinIdx;
@@ -1017,7 +1059,7 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
         processHistogramStep<1, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
             smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-            force_begin, force_end_start, row_num_valid_pages);
+            force_begin, force_end_start, row_num_valid_pages, -1, cachedLogits, cachedBins);
   }
   if (continueToNextStep) {
     // Stage 2: fp32 mid 10 bits.
@@ -1025,21 +1067,24 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
         processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
             smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-            force_begin, force_end_start, row_num_valid_pages, coarseThreshold);
+            force_begin, force_end_start, row_num_valid_pages, coarseThreshold,
+        cachedLogits, cachedBins);
   }
   if (continueToNextStep) {
-    // Prefill refines the final two fp32 bits if this bin still overflows.
+    // Compact selection refines the final two fp32 bits if this bin still overflows.
     const bool overflow = processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
         logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
         smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-        force_begin, force_end_start, row_num_valid_pages, coarseThreshold);
-    if constexpr (kPrefill) {
+        force_begin, force_end_start, row_num_valid_pages, coarseThreshold,
+        cachedLogits, cachedBins);
+    if constexpr (kCompact) {
       continueToNextStep = overflow;
       if (overflow) {
         processHistogramStep<4, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
             smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-            force_begin, force_end_start, row_num_valid_pages, coarseThreshold);
+            force_begin, force_end_start, row_num_valid_pages, coarseThreshold,
+        cachedLogits, cachedBins);
       }
     }
   }
@@ -1056,7 +1101,7 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
     const int selectionLane = threadIdx.x & 31;
     const int selectionWarp = threadIdx.x >> 5;
 
-    if (!kPrefill && finalCount <= kIndexerQuadraticSelectionLimit) {
+    if (!kCompact && finalCount <= kIndexerQuadraticSelectionLimit) {
       for (int i = threadIdx.x; i < finalCount; i += kNumThreadsPerBlock) {
         int outIndex = 0;
         const float logit = smemFinal.items.logits[i];
@@ -1086,15 +1131,17 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
       }
       __syncthreads();
 
-      CandidateWarpSort(smemFinal.candidateWarpSort.warps[selectionWarp])
-          .Sort(candidateKeys, FinalCandidateKeyGreater{});
+      if (selectionWarp < kSelectionWarps) {
+        CandidateWarpSort(smemFinal.candidateWarpSort.warps[selectionWarp])
+            .Sort(candidateKeys, FinalCandidateKeyGreater{});
 
 #pragma unroll
-      for (int item = 0; item < kCandidatesPerThread; ++item) {
-        const int rank = selectionLane * kCandidatesPerThread + item;
-        if (rank < numFinalSelections) {
-          smemWarpTopCandidateKeys[selectionWarp * numFinalSelections + rank] =
-              candidateKeys[item];
+        for (int item = 0; item < kCandidatesPerThread; ++item) {
+          const int rank = selectionLane * kCandidatesPerThread + item;
+          if (rank < numFinalSelections) {
+            smemWarpTopCandidateKeys[selectionWarp * numFinalSelections + rank] =
+                candidateKeys[item];
+          }
         }
       }
       __syncthreads();
@@ -1102,7 +1149,7 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
       // Merge the per-warp top keys with warp 0.  No item ranked below R within
       // its own warp can enter the block-wide top R.
       if (selectionWarp == 0) {
-        const int numWarpCandidates = kNumWarps * numFinalSelections;
+        const int numWarpCandidates = kSelectionWarps * numFinalSelections;
         uint64_t warpCandidateKeys[kWarpCandidatesPerLane];
 #pragma unroll
         for (int item = 0; item < kWarpCandidatesPerLane; ++item) {

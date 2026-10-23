@@ -2427,8 +2427,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     int last = min(int(get<1>(problem_shape)), offset + end);
     if (covered >= (last + 127) / 128) return;
     int batch_idx = get<2, 1>(blk_coord);
+    int _seg_off_sz = get<3, 1>(params_problem_shape) + 1;
     int segment_offset = SEG_OFF_LOAD(get<0>(params_problem_shape), batch_idx,
-                                      get<3, 1>(params_problem_shape) + 1);
+                                      _seg_off_sz);
     Tensor scores = make_tensor(make_gmem_ptr(epilogue.params.ptr_MaxScore),
                                  epilogue.params.layout_MaxScore);
     // These columns have no local K and are outside every softmax store.

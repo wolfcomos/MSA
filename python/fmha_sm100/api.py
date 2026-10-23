@@ -84,6 +84,8 @@ def _new_ws_cache():
 def _alloc_workspace_buf(tag, size, device, dtype):
     global _workspace_cache
     device_id = torch.device(device).index
+    if device_id is None:
+        device_id = torch.cuda.current_device()
     buf = _workspace_cache[device_id][tag]
     if buf is not None and buf.shape[0] >= size:
         return buf

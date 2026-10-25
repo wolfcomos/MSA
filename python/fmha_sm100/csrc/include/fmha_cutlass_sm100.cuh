@@ -91,7 +91,7 @@ struct FwdRunner {
   static constexpr int kPackFactor = cutlass::fmha::collective::pack_factor_of<ActiveMask>::value;
   // The ICP prefill scorer (not the short-query single-WG one) gets the deeper K ring.
   using MainloopMask = std::conditional_t<kIcp && !SingleSoftmaxWarpGroup,
-                                          cutlass::fmha::collective::IcpPrefillMask<ActiveMask, KVPageSize == 128 ? 8 : 16>,
+                                          cutlass::fmha::collective::IcpPrefillMask<ActiveMask, 1024 / KVPageSize>,
                                           ActiveMask>;
 
   using Mainloop = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<

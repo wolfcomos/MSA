@@ -640,7 +640,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        if constexpr (CollectiveMainloop::kNeedIcp && CollectiveMainloop::KVPageSize == 64
+        if constexpr (CollectiveMainloop::kNeedIcp && CollectiveMainloop::KVPageSize <= 64
                       && !IsSplitKV) {
           static_assert(NumWarpsCorrection == 4);
           mainloop.complete_icp_score_rows(blk_coord, params.mainloop, logical_problem_shape,

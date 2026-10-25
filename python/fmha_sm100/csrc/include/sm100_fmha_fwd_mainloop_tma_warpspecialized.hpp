@@ -303,7 +303,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       ? kv_stage_count_of<Mask_>::value : StageCountKV_shipped;
   static_assert(kv_stage_count_of<Mask_>::value == 0 ||
                 (kNeedIcp && !IsSplitKV && sizeof(Element_) == 1
-                 && (KVPageSize == 64 || KVPageSize == 128)
+                 && (KVPageSize == 32 || KVPageSize == 64 || KVPageSize == 128)
                  && get<0>(ThreadShape{}) == 1 && get<1>(ThreadShape{}) == 2),
                 "the deep K ring is restricted to the OnlyScoreIcp FP8 prefill scorer");
 
@@ -969,7 +969,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // The P tile is get<1>(TileShapeQK)/4 * sizeof(Element) columns: 16 for the page-64 ICP scorer.
     using TMEM_STORE = std::conditional_t<(decltype(_tilePlikeFP32())::value >= 32),
                                           SM100_TMEM_STORE_32dp32b32x,
-                                          SM100_TMEM_STORE_32dp32b16x>;
+                                          std::conditional_t<(decltype(_tilePlikeFP32())::value >= 16),
+                                                             SM100_TMEM_STORE_32dp32b16x,
+                                                             SM100_TMEM_STORE_32dp32b8x>>;
     using TMEM_STORE_V = SM100_TMEM_STORE_32dp32b2x;
 
     static auto _dummy_load() { return make_tmem_copy(TMEM_LOAD{}, _dummy_tStS()); }
@@ -1536,9 +1538,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         } else {
           packed_maxscore_path();
         }
-        if constexpr (kNeedIcp && KVPageSize == 128) {
-          ms_base += icp_rank_of(params.load.kv_block_num) * ms_stride_k;
-          ms_stride_k *= icp_c_of(params.load.kv_block_num);
+        if constexpr (kNeedIcp) {
+          if (KVPageSize * icp_c_of(params.load.kv_block_num) == 256) {
+            ms_base += icp_rank_of(params.load.kv_block_num) * KVPageSize / 128 * ms_stride_k;
+            ms_stride_k *= 2;
+          }
         }
       }
 
@@ -2422,6 +2426,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   CUTLASS_DEVICE void complete_icp_score_rows(
       BlkCoord const& blk_coord, Params const& params, ProblemShape const& problem_shape,
       ParamsProblemShape const& params_problem_shape, CollectiveEpilogue const& epilogue) {
+    if (KVPageSize * icp_c_of(params.load.kv_block_num) != 128) return;
     constexpr int kColumnsPerTrip = get<1>(ThreadShape{});
     int covered = Load::icp_local_blocks_exact(int(get<1>(problem_shape)),
                                               params.load.kv_block_num) == 0

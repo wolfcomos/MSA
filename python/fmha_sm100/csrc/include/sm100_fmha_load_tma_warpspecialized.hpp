@@ -105,12 +105,12 @@ struct Sm100FmhaLoadTmaWarpspecialized {
                 "MSA_NVFP4_KV_MODE >= 2 requires the paged KV path (KVPageSize > 0); the "
                 "non-paged load lambdas do not write a k2::StageTag.");
 
-  // P128 is interleaved; P256 assigns each rank a contiguous B128 fragment.
+  // P128 is interleaved; P256 assigns each rank contiguous token rows.
   CUTLASS_DEVICE static int icp_global_row(int local_row, int packed_rank_c) {
     int W = packed_rank_c & 15;
     int r = packed_rank_c >> 4;
-    if constexpr (KVPageSize == 128) {
-      return (local_row / 128 * W + r) * 128 + local_row % 128;
+    if (KVPageSize * W == 256) {
+      return (local_row / KVPageSize * W + r) * KVPageSize + local_row % KVPageSize;
     } else {
       return local_row * W + r;
     }
@@ -119,9 +119,9 @@ struct Sm100FmhaLoadTmaWarpspecialized {
   CUTLASS_DEVICE static int icp_local_rows(int kv_len, int packed_rank_c) {
     int W = packed_rank_c & 15;
     int r = packed_rank_c >> 4;
-    if constexpr (KVPageSize == 128) {
-      int full = kv_len / (128 * W);
-      return full * 128 + max(0, min(128, kv_len % (128 * W) - r * 128));
+    if (KVPageSize * W == 256) {
+      int full = kv_len / 256;
+      return full * KVPageSize + max(0, min(KVPageSize, kv_len % 256 - r * KVPageSize));
     } else {
       return max(0, (kv_len + W - 1 - r) / W);
     }

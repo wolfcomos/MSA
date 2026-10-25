@@ -20,8 +20,9 @@ import torch
     ],
 )
 @pytest.mark.parametrize("device_plan", [False, True])
+@pytest.mark.parametrize("tp", [2, 4])
 @torch.inference_mode()
-def test_sharded_score_missing_columns(query_lens, prefixes, device_plan):
+def test_sharded_score_missing_columns(query_lens, prefixes, device_plan, tp):
     from fmha_sm100.api import (
         _get_num_cta,
         fmha_index_score_sharded,
@@ -103,10 +104,11 @@ def test_sharded_score_missing_columns(query_lens, prefixes, device_plan):
     with pytest.raises(ValueError, match="query shape"):
         fmha_index_score_sharded(
             query[begin:end],
-            cache[:, ::2].contiguous(),
+            cache[:, ::tp].contiguous(),
             table,
             {**plan, "num_kv_splits": 2},
             rank=0,
+            tp=tp,
             max_score=storage[: end - begin, :, :pages],
             sm_scale=1.0,
             initialize=False,
@@ -118,8 +120,8 @@ def test_sharded_score_missing_columns(query_lens, prefixes, device_plan):
                 page, tail = table[req, (length - 1) // 128], (length - 1) % 128
                 cache[page, tail:] = 0
                 cache[page, tail:, 0] = 256
-        for rank in range(2):
-            shard = cache[:, rank::2].contiguous()
+        for rank in range(tp):
+            shard = cache[:, rank::tp].contiguous()
             reference = torch.full(
                 (total_q, heads, pages), -float("inf"), device=device
             )
@@ -129,13 +131,13 @@ def test_sharded_score_missing_columns(query_lens, prefixes, device_plan):
                 q = query[offsets[req] : offsets[req + 1]].float()
                 keys = shard[table[req]].float().reshape(-1, 128)
                 dots = torch.einsum("qhd,kd->qhk", q, keys)
-                key_pos = torch.arange(rank, pages * 128, 2, device=device)
+                key_pos = torch.arange(rank, pages * 128, tp, device=device)
                 causal = positions[offsets[req] : offsets[req + 1]]
                 dots.masked_fill_(
                     key_pos[None, None, :] > causal[:, None, None], -float("inf")
                 )
                 reference[offsets[req] : offsets[req + 1]] = dots.reshape(
-                    q_len, heads, pages, 64
+                    q_len, heads, pages, 128 // tp
                 ).amax(-1)
             for begin, end, plan in plans:
                 storage.fill_(poison)
@@ -146,6 +148,7 @@ def test_sharded_score_missing_columns(query_lens, prefixes, device_plan):
                     table,
                     plan,
                     rank=rank,
+                    tp=tp,
                     max_score=scores,
                     sm_scale=1.0,
                     initialize=False,

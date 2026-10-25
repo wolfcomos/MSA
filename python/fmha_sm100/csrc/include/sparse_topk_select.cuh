@@ -43,8 +43,10 @@
 #define FLASHINFER_SPARSE_TOPK_SELECT_CUH_
 
 #include <cuda.h>
+#include <cuda/atomic>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
 #include <cfloat>
 #include <cstdint>
@@ -161,6 +163,8 @@ __device__ __forceinline__ uint32_t extractBinIdx(float x) {
       return (bits >> 12) & 0x3ff;      // mid 10 bits (was (>> 10) & 0x7ff)
     } else if constexpr (step == 3) {
       return (bits >> 2) & 0x3ff;       // next-low 10 bits, drops bits 0-1
+    } else {
+      return bits & 3u;
     }
   }
 }
@@ -244,7 +248,27 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
                                      int* smemFinalBinSize, int* smemFoundTopKValues,
                                      SmemFinalType& smemFinal, int rowStart, int topK,
                                      uint32_t force_begin, uint32_t force_end_start,
-                                     uint32_t row_num_valid_pages) {
+                                     uint32_t row_num_valid_pages,
+                                     int coarseThreshold = -1,
+                                     const float* cachedLogits = nullptr,
+                                     const uint32_t* cachedBins = nullptr) {
+  constexpr bool kCompact = kNumFinalItems == 128;
+  constexpr bool kCached = kCompact && kNumThreadsPerBlock == 512;
+  const bool cacheRow = kCached && rowEnd - rowStart <= 3 * kNumThreadsPerBlock;
+  auto visit = [&](auto process) {
+    if constexpr (kCached) {
+      if (cacheRow) {
+#pragma unroll
+        for (int item = 0; item < 3; ++item) {
+          const int idx = threadIdx.x + item * kNumThreadsPerBlock;
+          if (idx < rowEnd - rowStart) process(cachedLogits[item], idx);
+        }
+        return;
+      }
+    }
+    vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart,
+                       rowEnd - rowStart, process);
+  };
   // Clear the histogram.
 #pragma unroll
   for (int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock) {
@@ -254,10 +278,10 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
 
   // Update pattern.
   const int prevThresholdBinIdx = thresholdBinIdx;
-  constexpr auto patternShift = step < 2 ? 0 : step == 2 ? 22 : 12;
+  constexpr auto patternShift = step < 2 ? 0 : step == 2 ? 22 : step == 3 ? 12 : 2;
   if constexpr (step == 2) {
     logitPattern = static_cast<uint32_t>(thresholdBinIdx & 0x3ff) << patternShift;
-  } else if constexpr (step == 3) {
+  } else if constexpr (step >= 3) {
     logitPattern |= static_cast<uint32_t>(thresholdBinIdx & 0x3ff) << patternShift;
   }
 
@@ -270,6 +294,9 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
     if constexpr (step == 1) {
       return extractBinIdx<0>(logit) == static_cast<uint32_t>(prevThresholdBinIdx);
     } else {
+      if constexpr (kCompact && step >= 2) {
+        if (extractBinIdx<0>(logit) != static_cast<uint32_t>(coarseThreshold)) return false;
+      }
       return isPartialMatch<patternShift>(logit, logitPattern);
     }
   };
@@ -278,51 +305,85 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
     logit = effective_logit(logit, idx);
     if (matchesCurrentRefinement(logit)) {
       uint32_t binIdx = extractBinIdx<step>(logit);
-      atomicAdd(&smemFinal.histo.data[binIdx], 1);
+      if constexpr (kCached && step == 0) {
+        if (cacheRow) binIdx = cachedBins[idx / kNumThreadsPerBlock];
+      }
+      if constexpr (kCompact) {
+        const unsigned peers = __match_any_sync(__activemask(), binIdx);
+        if ((threadIdx.x & 31) == __ffs(peers) - 1) {
+          atomicAdd(&smemFinal.histo.data[binIdx], __popc(peers));
+        }
+      } else {
+        atomicAdd(&smemFinal.histo.data[binIdx], 1);
+      }
     }
   };
 
   // Distribute the elements to the histogram bins.
-  vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart, rowEnd - rowStart,
-                     distributeToBins);
+  visit(distributeToBins);
   __syncthreads();
 
   // Reads the value of the starting position in smemOutput accounting.
   int lastValue = smemFoundTopKValues[0];
 
-  for (int round = 0; round < kNumBins / kNumThreadsPerBlock; round++) {
-    // Read the values from SMEM.
-    int idx = threadIdx.x + kNumThreadsPerBlock * round;
-    int binCount{0};
-    binCount = smemFinal.histo.data[idx];
-    __syncthreads();
-
-    // Compute the prefix sum.
-    int prefixSum{0}, totalSum{0};
+  if constexpr (kCompact) {
+    // Scan contiguous bins per thread with one block scan.
+    constexpr int kBinsPerThread = kNumBins / kNumThreadsPerBlock;
+    const int base = threadIdx.x * kBinsPerThread;
+    int counts[kBinsPerThread], sum = 0;
+#pragma unroll
+    for (int i = 0; i < kBinsPerThread; ++i) {
+      counts[i] = smemFinal.histo.data[base + i];
+      sum += counts[i];
+    }
+    int prefix = 0;
     using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
-    Scan(smemFinal.histo.scan).ExclusiveSum(binCount, prefixSum, totalSum);
-
-    prefixSum += lastValue;
-    totalSum += lastValue;
-    smemFinal.histo.data[idx] = prefixSum;
-    __syncthreads();
-
-    bool foundThreshold = false;
-    if (prefixSum < topK) {
-      int nextPrefixSum = threadIdx.x == kNumThreadsPerBlock - 1
-                              ? totalSum
-                              : smemFinal.histo.data[idx + 1];
-      if (nextPrefixSum >= topK) {
-        smemThresholdBinIdx[0] = idx;
-        smemFinalBinSize[0] = nextPrefixSum - prefixSum;
-        foundThreshold = true;
+    Scan(smemFinal.histo.scan).ExclusiveSum(sum, prefix);
+    prefix += lastValue;
+#pragma unroll
+    for (int i = 0; i < kBinsPerThread; ++i) {
+      if (prefix < topK && prefix + counts[i] >= topK) {
+        smemThresholdBinIdx[0] = base + i;
+        smemFinalBinSize[0] = counts[i];
+        smemFinal.histo.data[base + i] = prefix;
       }
+      prefix += counts[i];
     }
+  } else {
+    for (int round = 0; round < kNumBins / kNumThreadsPerBlock; round++) {
+      // Read the values from SMEM.
+      int idx = threadIdx.x + kNumThreadsPerBlock * round;
+      int binCount{0};
+      binCount = smemFinal.histo.data[idx];
+      __syncthreads();
 
-    if (__syncthreads_or(foundThreshold)) {
-      break;
+      // Compute the prefix sum.
+      int prefixSum{0}, totalSum{0};
+      using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
+      Scan(smemFinal.histo.scan).ExclusiveSum(binCount, prefixSum, totalSum);
+
+      prefixSum += lastValue;
+      totalSum += lastValue;
+      smemFinal.histo.data[idx] = prefixSum;
+      __syncthreads();
+
+      bool foundThreshold = false;
+      if (prefixSum < topK) {
+        int nextPrefixSum = threadIdx.x == kNumThreadsPerBlock - 1
+                                ? totalSum
+                                : smemFinal.histo.data[idx + 1];
+        if (nextPrefixSum >= topK) {
+          smemThresholdBinIdx[0] = idx;
+          smemFinalBinSize[0] = nextPrefixSum - prefixSum;
+          foundThreshold = true;
+        }
+      }
+
+      if (__syncthreads_or(foundThreshold)) {
+        break;
+      }
+      lastValue = totalSum;
     }
-    lastValue = totalSum;
   }
   __syncthreads();
 
@@ -332,12 +393,15 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
     logit = effective_logit(logit, idx);
     if (matchesCurrentRefinement(logit)) {
       uint32_t binIdx = extractBinIdx<step>(logit);
+      if constexpr (kCached && step == 0) {
+        if (cacheRow) binIdx = cachedBins[idx / kNumThreadsPerBlock];
+      }
       if (binIdx < thresholdBinIdx) {
         // The element is part of the top-k selection.
         int dstIdx = atomicAdd(&smemFoundTopKValues[0], 1);
         smemOutput[dstIdx] = idx;
       }
-      if constexpr (step < 3) {
+      if constexpr (step < (kCompact ? 4 : 3)) {
         // Only fill final items for sorting if the threshold bin fits.
         if (binIdx == thresholdBinIdx && smemFinalBinSize[0] <= kNumFinalItems) {
           int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
@@ -346,7 +410,7 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
         }
       } else {
         if (binIdx == thresholdBinIdx) {
-          // Elements in the threshold bin share the same 32 bits at step 3.
+          // Include the final two bits before resolving exact ties.
           int dstIdx = atomicAdd(&smemFinal.histo.data[binIdx], 1);
           if (dstIdx < topK) {
             smemOutput[dstIdx] = idx;
@@ -356,8 +420,7 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
     }
   };
 
-  vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart, rowEnd - rowStart,
-                     processBins);
+  visit(processBins);
   __syncthreads();
 
   // Continue to next step if the threshold bin overflows the staging buffer.
@@ -697,8 +760,87 @@ constexpr int kIndexerNumBins = 1024;  // 10-bit hist (was 2048 / 11-bit)
 constexpr int kIndexerNumFinalItems = 2048;
 constexpr int kIndexerQuadraticSelectionLimit = 416;
 
-template <uint32_t MAX_TOPK>
-__global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSortKernel(
+struct SparseTopKPublish {
+  const int64_t* recv_bases = nullptr;
+  int32_t* errors = nullptr;
+  uint32_t slot = 0, rank = 0, world = 0, heads_per_rank = 0, capacity = 0;
+  uint32_t spin_limit = 0;
+  uint32_t* generations = nullptr;
+
+  // Warp 0 publishes tagged words or acquires/releases a legacy ready row.
+  __device__ void operator()(uint32_t token, uint32_t head, const float* scores,
+                            int32_t id) const {
+    const uint32_t lane = threadIdx.x & 31;
+    int32_t* peer = reinterpret_cast<int32_t*>(recv_bases[head / heads_per_rank]);
+    const size_t row_idx =
+        ((static_cast<size_t>(slot) * world + rank) * heads_per_rank +
+         head % heads_per_rank) * capacity + token;
+    if (generations != nullptr) {
+      uint32_t* counter = generations +
+          (static_cast<size_t>(slot) * world * heads_per_rank + head) * capacity + token;
+      uint32_t generation = 0;
+      if (lane == 0) {
+        generation = *counter + 1u;
+        if (generation == 0) generation = 1;
+      }
+      generation = __shfl_sync(0xffffffffu, generation, 0);
+      if (lane < 16) {
+        uint64_t* row = reinterpret_cast<uint64_t*>(peer) + row_idx * 32;
+        const uint64_t tag = static_cast<uint64_t>(generation) << 32;
+        const uint64_t score =
+            tag | __float_as_uint(id >= 0 ? scores[id] : -CUDART_INF_F);
+        const uint64_t index = tag | static_cast<uint32_t>(id);
+        asm volatile("st.relaxed.sys.u64 [%0], %1;"
+                     :: "l"(row + lane), "l"(score)
+                     : "memory");
+        asm volatile("st.relaxed.sys.u64 [%0], %1;"
+                     :: "l"(row + 16 + lane), "l"(index)
+                     : "memory");
+      }
+      __syncwarp();
+      if (lane == 0) *counter = generation;
+      return;
+    }
+    int32_t* row = peer + row_idx * 33;
+    cuda::atomic_ref<int32_t, cuda::thread_scope_system> ready(row[32]);
+    if (lane == 0) {
+      uint32_t spins = 0;
+      while (ready.load(cuda::memory_order_acquire) != 0) {
+        if (++spins >= spin_limit) {
+          atomicAdd(errors, 1);
+          asm volatile("trap;");
+        }
+      }
+    }
+    __syncwarp();
+    if (lane < 16) {
+      row[lane] = __float_as_int(id >= 0 ? scores[id] : -CUDART_INF_F);
+      row[16 + lane] = id;
+    }
+    __syncwarp();
+    if (lane == 0) ready.store(1, cuda::memory_order_release);
+  }
+};
+
+struct SparseTopKPrefill {
+  int32_t* carrier;
+  uint64_t stride_h, stride_t;
+
+  __device__ void operator()(uint32_t token, uint32_t head, const float* scores,
+                            int32_t id) const {
+    const uint32_t lane = threadIdx.x & 31;
+    int32_t* row = carrier + head * stride_h + token * stride_t;
+    if (lane < 16) {
+      row[lane] = __float_as_int(id >= 0 ? scores[id] : -CUDART_INF_F);
+      row[16 + lane] = id;
+    }
+    if (lane == 0) row[32] = 1;
+  }
+};
+
+template <uint32_t MAX_TOPK, bool PUBLISH = false, typename Publisher = SparseTopKPublish>
+__global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> ? 128 :
+                                  kIndexerNumThreadsPerBlock)) IndexerTopKWithSortKernel(
     const float* __restrict__ in,        // row-contig fp32: (H, T, K) or (T, H, K)
     int32_t* __restrict__ out,           // (qo, num_qo_heads, topk) logical int32
     const int32_t* __restrict__ block_table,
@@ -714,17 +856,22 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     uint32_t num_valid_pages,
     const int32_t* __restrict__ num_valid_pages_per_token,
     uint32_t force_begin, uint32_t force_end,
-    uint32_t input_qo_outermost, uint32_t use_pdl) {
+    uint32_t input_qo_outermost, uint32_t use_pdl, Publisher publish) {
+  static_assert(!PUBLISH || MAX_TOPK == 16);
   static_assert(MAX_TOPK <= kSparseTopkMaxK, "MAX_TOPK exceeds supported max");
 
-  constexpr int kNumThreadsPerBlock = kIndexerNumThreadsPerBlock;
+  constexpr bool kPrefill = std::is_same_v<Publisher, SparseTopKPrefill>;
+  constexpr int kNumThreadsPerBlock = kPrefill ? 128 : kIndexerNumThreadsPerBlock;
   constexpr int kNumBins = kIndexerNumBins;
-  constexpr int kNumFinalItems = kIndexerNumFinalItems;
+  constexpr bool kCompact = PUBLISH;
+  constexpr bool kCached = PUBLISH && !kPrefill;
+  constexpr int kNumFinalItems = kCompact ? 128 : kIndexerNumFinalItems;
   constexpr int kNumWarps = kNumThreadsPerBlock / 32;
   constexpr int kCandidatesPerThread =
       (kNumFinalItems + kNumThreadsPerBlock - 1) / kNumThreadsPerBlock;
+  constexpr int kSelectionWarps = kCompact ? 4 : kNumWarps;
   constexpr int kWarpCandidatesPerLane =
-      (kNumWarps * MAX_TOPK + 31) / 32;
+      (kSelectionWarps * MAX_TOPK + 31) / 32;
   static_assert(kNumThreadsPerBlock % 32 == 0);
   static_assert(kCandidatesPerThread * kNumThreadsPerBlock >= kNumFinalItems);
 
@@ -741,7 +888,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     int data[kNumBins];
   };
   struct CandidateWarpSortStorage {
-    typename CandidateWarpSort::TempStorage warps[kNumWarps];
+    typename CandidateWarpSort::TempStorage warps[kSelectionWarps];
   };
 
   // SMEM union — v2.1 dropped the cub::BlockRadixSort sortByIndex member
@@ -761,7 +908,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   __shared__ int smemFinalDstIdx[1];
   __shared__ int smemFinalBinSize[1];
   __shared__ int smemFoundTopKValues[1];
-  __shared__ uint64_t smemWarpTopCandidateKeys[kNumWarps * MAX_TOPK];
+  __shared__ uint64_t smemWarpTopCandidateKeys[kSelectionWarps * MAX_TOPK];
 
   // ---- bid -> row decode ---------------------------------------------------
   // HKT transpose path: bid = qo_head_idx * total_qo_len + t.
@@ -785,6 +932,9 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   const int rowStart = 0;
   const int topK = static_cast<int>(topk);
   SparseTopKWaitOnDependentGrids(use_pdl);
+  if constexpr (PUBLISH) {
+    if (threadIdx.x == 0) SparseTopKLaunchDependentGrids(use_pdl);
+  }
   const uint32_t row_num_valid_pages =
       LoadRowNumValidPages(num_valid_pages_per_token, t, num_valid_pages);
   // Padding is always -inf and can never be a useful sparse-attention page.
@@ -801,10 +951,18 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   // histogram path so large -inf padding ties cannot manufacture arbitrary
   // duplicate/OOB selections.
   if (row_num_valid_pages <= static_cast<uint32_t>(topK)) {
-    int32_t* row_out = out + row_offset_out;
     const int valid_count = (row_num_valid_pages < static_cast<uint32_t>(rowLen))
                                 ? static_cast<int>(row_num_valid_pages)
                                 : rowLen;
+    if constexpr (PUBLISH) {
+      if (threadIdx.x < 32) {
+        const int32_t id = threadIdx.x < valid_count
+                               ? static_cast<int32_t>(threadIdx.x) : -1;
+        publish(t, qo_head_idx, logits, id);
+      }
+      return;
+    }
+    int32_t* row_out = out + row_offset_out;
     for (int rowIt = threadIdx.x; rowIt < valid_count; rowIt += kNumThreadsPerBlock) {
       row_out[static_cast<size_t>(rowIt) * out_stride_k] =
           GatherBlockTableValue(block_table_row, block_table_stride_k, rowIt);
@@ -822,11 +980,19 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   // ---- Trivial path: rowLen <= topK (defensive — host dispatcher already
   //      catches max_k_tiles <= topk via SparseTopKIdentityFillKernel).
   if (rowLen <= topK) {
-    int32_t* row_out = out + row_offset_out;
     // OOB clamp: indices >= num_valid_pages → -1
     const int valid_count = (static_cast<int>(row_num_valid_pages) < rowLen)
                                 ? static_cast<int>(row_num_valid_pages)
                                 : rowLen;
+    if constexpr (PUBLISH) {
+      if (threadIdx.x < 32) {
+        const int32_t id = threadIdx.x < valid_count
+                               ? static_cast<int32_t>(threadIdx.x) : -1;
+        publish(t, qo_head_idx, logits, id);
+      }
+      return;
+    }
+    int32_t* row_out = out + row_offset_out;
     for (int rowIt = threadIdx.x; rowIt < valid_count; rowIt += kNumThreadsPerBlock) {
       row_out[static_cast<size_t>(rowIt) * out_stride_k] =
           GatherBlockTableValue(block_table_row, block_table_stride_k, rowIt);
@@ -850,20 +1016,50 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   int thresholdBinIdx = -1;
   uint32_t logitPattern = 0;
 
-  // ---- Stage 0: fp16 10-bit hist -----------------------------------------
-  bool continueToNextStep =
-      processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
-          logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
-          smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-          force_begin, force_end_start, row_num_valid_pages);
+  float cachedLogits[kCached ? 3 : 1];
+  uint32_t cachedBins[kCached ? 3 : 1];
+  if constexpr (kCached) {
+    if (rowLen <= 3 * kNumThreadsPerBlock) {
+#pragma unroll
+      for (int item = 0; item < 3; ++item) {
+        const int idx = threadIdx.x + item * kNumThreadsPerBlock;
+        if (idx < rowLen) {
+          cachedLogits[item] =
+              IsForcedBlock(idx, force_begin, force_end_start, row_num_valid_pages)
+                  ? FLT_MAX : logits[idx];
+          cachedBins[item] = extractBinIdx<0>(cachedLogits[item]);
+        }
+      }
+    }
+  }
 
+  // ---- Stage 0: fp16 10-bit hist -----------------------------------------
+  bool continueToNextStep = false;
+  if (kCompact && rowLen <= kNumFinalItems) {
+    if (threadIdx.x < rowLen) {
+      smemFinal.items.logits[threadIdx.x] =
+          IsForcedBlock(threadIdx.x, force_begin, force_end_start, row_num_valid_pages)
+              ? FLT_MAX : logits[threadIdx.x];
+      smemFinal.items.indices[threadIdx.x] = threadIdx.x;
+    }
+    if (threadIdx.x == 0) smemFinalDstIdx[0] = rowLen;
+    __syncthreads();
+  } else {
+    continueToNextStep =
+        processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
+            logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
+            smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
+            force_begin, force_end_start, row_num_valid_pages, -1, cachedLogits, cachedBins);
+  }
+
+  const int coarseThreshold = thresholdBinIdx;
   if (continueToNextStep) {
     // Stage 1: fp32 high 10 bits.
     continueToNextStep =
         processHistogramStep<1, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
             smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-            force_begin, force_end_start, row_num_valid_pages);
+            force_begin, force_end_start, row_num_valid_pages, -1, cachedLogits, cachedBins);
   }
   if (continueToNextStep) {
     // Stage 2: fp32 mid 10 bits.
@@ -871,15 +1067,26 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
         processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
             smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-            force_begin, force_end_start, row_num_valid_pages);
+            force_begin, force_end_start, row_num_valid_pages, coarseThreshold,
+            cachedLogits, cachedBins);
   }
   if (continueToNextStep) {
-    // Stage 3: fp32 low 10 bits.  After this step every remaining tie shares
-    // the same 32-bit pattern so we just fill the topk window directly.
-    processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
+    // Compact selection refines the final two fp32 bits if this bin still overflows.
+    const bool overflow = processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
         logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
         smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-        force_begin, force_end_start, row_num_valid_pages);
+        force_begin, force_end_start, row_num_valid_pages, coarseThreshold,
+        cachedLogits, cachedBins);
+    if constexpr (kCompact) {
+      continueToNextStep = overflow;
+      if (overflow) {
+        processHistogramStep<4, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
+            logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
+            smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
+            force_begin, force_end_start, row_num_valid_pages, coarseThreshold,
+            cachedLogits, cachedBins);
+      }
+    }
   }
 
   if (!continueToNextStep) {
@@ -894,7 +1101,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     const int selectionLane = threadIdx.x & 31;
     const int selectionWarp = threadIdx.x >> 5;
 
-    if (finalCount <= kIndexerQuadraticSelectionLimit) {
+    if (!kCompact && finalCount <= kIndexerQuadraticSelectionLimit) {
       for (int i = threadIdx.x; i < finalCount; i += kNumThreadsPerBlock) {
         int outIndex = 0;
         const float logit = smemFinal.items.logits[i];
@@ -924,15 +1131,17 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
       }
       __syncthreads();
 
-      CandidateWarpSort(smemFinal.candidateWarpSort.warps[selectionWarp])
-          .Sort(candidateKeys, FinalCandidateKeyGreater{});
+      if (selectionWarp < kSelectionWarps) {
+        CandidateWarpSort(smemFinal.candidateWarpSort.warps[selectionWarp])
+            .Sort(candidateKeys, FinalCandidateKeyGreater{});
 
 #pragma unroll
-      for (int item = 0; item < kCandidatesPerThread; ++item) {
-        const int rank = selectionLane * kCandidatesPerThread + item;
-        if (rank < numFinalSelections) {
-          smemWarpTopCandidateKeys[selectionWarp * numFinalSelections + rank] =
-              candidateKeys[item];
+        for (int item = 0; item < kCandidatesPerThread; ++item) {
+          const int rank = selectionLane * kCandidatesPerThread + item;
+          if (rank < numFinalSelections) {
+            smemWarpTopCandidateKeys[selectionWarp * numFinalSelections + rank] =
+                candidateKeys[item];
+          }
         }
       }
       __syncthreads();
@@ -940,7 +1149,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
       // Merge the per-warp top keys with warp 0.  No item ranked below R within
       // its own warp can enter the block-wide top R.
       if (selectionWarp == 0) {
-        const int numWarpCandidates = kNumWarps * numFinalSelections;
+        const int numWarpCandidates = kSelectionWarps * numFinalSelections;
         uint64_t warpCandidateKeys[kWarpCandidatesPerLane];
 #pragma unroll
         for (int item = 0; item < kWarpCandidatesPerLane; ++item) {
@@ -966,7 +1175,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
 
   // ---- v2.1 warp-only fused asc-by-index sort -----------------------------
   // After final-candidate selection fills smemOutput[0..topk-1] (unsorted by index),
-  // only warp 0 (32 lanes) participates in the sort.  Other 480 threads idle.
+  // only warp 0 (32 lanes) participates in the sort.  Other threads idle.
   //
   // Why warp-only vs cub::BlockRadixSort<512, 1>:
   //   - cub::BlockRadixSort<uint32_t, 512, 1>.Sort() processes ALL 512 thread
@@ -984,7 +1193,8 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   const uint32_t lane = threadIdx.x & 31;
   if (warp_id != 0) return;  // only warp 0 sorts and writes the output
 
-  int32_t* row_out = out + row_offset_out;
+  int32_t* row_out = nullptr;
+  if constexpr (!PUBLISH) row_out = out + row_offset_out;
 
   if constexpr (MAX_TOPK <= 32) {
     // 32 lanes × 1 key.  Lanes >= topk pad with sentinel ~0u (sorts to end).
@@ -998,8 +1208,10 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
       key = valid ? static_cast<uint32_t>(idx) : ~0u;
     }
     WarpBitonicSortAsc32(key, lane);
-    if (lane < topK) {
-      const int32_t logical_idx = (key == ~0u) ? -1 : static_cast<int32_t>(key);
+    const int32_t logical_idx = (key == ~0u) ? -1 : static_cast<int32_t>(key);
+    if constexpr (PUBLISH) {
+      publish(t, qo_head_idx, logits, logical_idx);
+    } else if (lane < topK) {
       row_out[static_cast<size_t>(lane) * out_stride_k] =
           GatherBlockTableValue(block_table_row, block_table_stride_k, logical_idx);
     }
@@ -1073,6 +1285,7 @@ inline cudaError_t LaunchSparseTopKKernel(const void* kernel, dim3 grid, dim3 bl
 #endif
 }
 
+template <bool PUBLISH = false, typename Publisher = SparseTopKPublish>
 cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
                               const int32_t* block_table,
                               uint64_t out_stride_t, uint64_t out_stride_h,
@@ -1086,11 +1299,12 @@ cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
                               const int32_t* num_valid_pages_per_token,
                               uint32_t force_begin, uint32_t force_end,
                               bool input_qo_outermost,
-                              cudaStream_t stream, bool enable_pdl) {
+                              cudaStream_t stream, bool enable_pdl,
+                              Publisher publish = {}) {
   const uint32_t num_rows = total_qo_len * num_qo_heads;
   if (num_rows == 0) return cudaSuccess;
 
-  auto kernel = IndexerTopKWithSortKernel<16>;
+  auto kernel = IndexerTopKWithSortKernel<16, PUBLISH, Publisher>;
   const size_t dyn_smem_bytes = static_cast<size_t>(topk) * sizeof(int32_t);
   const uint32_t input_qo_outermost_u32 = input_qo_outermost ? 1u : 0u;
   const uint32_t use_pdl = enable_pdl ? 1u : 0u;
@@ -1102,9 +1316,9 @@ cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
                   (void*)&num_qo_heads, (void*)&max_k_tiles, (void*)&topk,
                   (void*)&num_valid_pages, (void*)&num_valid_pages_per_token,
                   (void*)&force_begin, (void*)&force_end, (void*)&input_qo_outermost_u32,
-                  (void*)&use_pdl};
+                  (void*)&use_pdl, (void*)&publish};
   dim3 grid(num_rows);
-  dim3 block(kIndexerNumThreadsPerBlock);
+  dim3 block(std::is_same_v<Publisher, SparseTopKPrefill> ? 128 : kIndexerNumThreadsPerBlock);
   return LaunchSparseTopKKernel((const void*)kernel, grid, block, args, dyn_smem_bytes,
                                 stream, enable_pdl);
 }

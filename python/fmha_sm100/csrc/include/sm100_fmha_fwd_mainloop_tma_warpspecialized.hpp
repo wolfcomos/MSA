@@ -1439,7 +1439,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
           // The causal mask maps these local rows to global token positions.
           int nloc = Load::icp_local_blocks_exact(int(get<1>(problem_shape)), params.load.kv_block_num);
           if (int(page_idx) >= nloc) {
-            cS = domain_offset(make_coord(q_s, INT_MAX / 4), cS_base);
+            cS = domain_offset(make_coord(q_s, INT_MAX / 16), cS_base);
             return false;
           }
           pos = int(page_idx);

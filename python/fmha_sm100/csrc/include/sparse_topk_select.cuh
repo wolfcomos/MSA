@@ -657,6 +657,21 @@ __device__ __forceinline__ uint64_t MakeFinalCandidateKey(float logit,
          static_cast<uint32_t>(source_index);
 }
 
+// Local TopK must use the merge kernel's stable score/index order: staging
+// position is not composable across independently selected rank candidates.
+__device__ __forceinline__ uint64_t MakeStableFinalCandidateKey(float logit,
+                                                               int source_index) {
+  const uint32_t raw_bits = __float_as_uint(logit);
+  const uint32_t bits = (raw_bits & 0x7fffffffu) == 0 ? 0u : raw_bits;
+  const uint32_t ordered_bits =
+      (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+  const uint32_t source = static_cast<uint32_t>(source_index);
+  return (static_cast<uint64_t>(ordered_bits) << 32) |
+         (static_cast<uint64_t>(kFinalCandidateSourceMask - source) <<
+          kFinalCandidateSourceBits) |
+         source;
+}
+
 struct FinalCandidateKeyGreater {
   __device__ __forceinline__ bool operator()(uint64_t lhs, uint64_t rhs) const {
     return lhs > rhs;
@@ -1105,9 +1120,12 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
       for (int i = threadIdx.x; i < finalCount; i += kNumThreadsPerBlock) {
         int outIndex = 0;
         const float logit = smemFinal.items.logits[i];
+        const int sourceIndex = smemFinal.items.indices[i];
         for (int j = 0; j < finalCount; ++j) {
           const float otherLogit = smemFinal.items.logits[j];
-          if (logit < otherLogit || (logit == otherLogit && i < j)) {
+          const bool tieRanksAhead =
+              kPrefill ? sourceIndex > smemFinal.items.indices[j] : i < j;
+          if (logit < otherLogit || (logit == otherLogit && tieRanksAhead)) {
             ++outIndex;
           }
         }
@@ -1125,8 +1143,13 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
         const int position = threadIdx.x + item * kNumThreadsPerBlock;
         candidateKeys[item] =
             position < finalCount
-                ? MakeFinalCandidateKey(smemFinal.items.logits[position], position,
-                                        smemFinal.items.indices[position])
+                ? (kPrefill
+                       ? MakeStableFinalCandidateKey(
+                             smemFinal.items.logits[position],
+                             smemFinal.items.indices[position])
+                       : MakeFinalCandidateKey(
+                             smemFinal.items.logits[position], position,
+                             smemFinal.items.indices[position]))
                 : 0;
       }
       __syncthreads();

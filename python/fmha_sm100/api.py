@@ -1558,7 +1558,8 @@ def sparse_topk_select_prefill(scores, num_valid_pages, carrier, *,
     Scores are contiguous float32 [T,H,K], with int32 valid counts [T]. The
     carrier can be a head-major query-chunk view: its final stride must be one.
     Rows contain raw score bits, ascending logical IDs, and a ready marker of
-    one; padding uses -inf/-1. Cutoff ties follow sparse_topk_select semantics.
+    one; padding uses -inf/-1. Cutoff ties prefer the lower logical block ID,
+    matching the distributed merge order.
     The caller orders subsequent collective access on this CUDA stream.
     """
     get_sparse_topk_module().sparse_topk_select_prefill(

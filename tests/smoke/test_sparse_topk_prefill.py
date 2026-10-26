@@ -10,6 +10,25 @@ from fmha_sm100 import sparse_topk_select_prefill
 from fmha_sm100.jit import get_sparse_topk_module
 
 
+@pytest.mark.parametrize("force_end", [0, 2])
+def test_prefill_cutoff_ties_use_stable_block_order(force_end):
+    pages = 64
+    scores = torch.ones((1, 1, pages), device="cuda", dtype=torch.float32)
+    valid = torch.tensor([pages], device="cuda", dtype=torch.int32)
+    carrier = torch.empty((1, 1, 33), device="cuda", dtype=torch.int32)
+
+    sparse_topk_select_prefill(
+        scores,
+        valid,
+        carrier,
+        force_end_blocks=force_end,
+    )
+
+    expected = list(range(16 - force_end))
+    expected.extend(range(pages - force_end, pages))
+    assert carrier[0, 0, 16:32].cpu().tolist() == expected
+
+
 @pytest.mark.parametrize(
     "pages,mode",
     [

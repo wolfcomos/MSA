@@ -7,6 +7,54 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize("tp,rank", [(2, 1), (4, 1), (4, 2), (4, 3)])
+@torch.inference_mode()
+def test_sharded_score_empty_rank_graph_replay(tp, rank):
+    from fmha_sm100.api import (
+        fmha_index_score_sharded,
+        fmha_index_score_sharded_plan,
+    )
+
+    device, batch, query_len, heads = torch.device("cuda"), 32, 8, 4
+    total_q = batch * query_len
+    lengths = torch.full((batch,), query_len, dtype=torch.int32)
+    plan = fmha_index_score_sharded_plan(
+        lengths,
+        lengths,
+        heads,
+        qo_offset=torch.zeros_like(lengths),
+        device=device,
+    )
+    query = torch.randn(total_q, heads, 128, device=device).to(torch.float8_e4m3fn)
+    cache = torch.randn(1, 256 // tp, 128, device=device).to(query.dtype)
+    block_table = torch.zeros(batch, 1, dtype=torch.int32, device=device)
+    scores = torch.empty(total_q, heads, 1, dtype=torch.float32, device=device)
+
+    def score():
+        fmha_index_score_sharded(
+            query,
+            cache,
+            block_table,
+            plan,
+            rank=rank,
+            tp=tp,
+            max_score=scores,
+            sm_scale=1.0,
+        )
+
+    score()
+    torch.cuda.synchronize()
+    assert torch.isneginf(scores).all()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        score()
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.isneginf(scores).all()
+
+
 @pytest.mark.parametrize(
     "query_lens,prefixes",
     [

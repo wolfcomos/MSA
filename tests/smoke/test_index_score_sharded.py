@@ -7,6 +7,71 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize("tp", [2, 4])
+@torch.inference_mode()
+def test_sharded_score_p256_compact_columns(tp):
+    from fmha_sm100.api import (
+        fmha_index_score_sharded,
+        fmha_index_score_sharded_plan,
+    )
+
+    torch.manual_seed(13)
+    device, query_len, heads, length = torch.device("cuda"), 5, 4, 641
+    blocks = (length + 127) // 128
+    pages = (length + 255) // 256
+    plan = fmha_index_score_sharded_plan(
+        torch.tensor([query_len], dtype=torch.int32),
+        torch.tensor([length], dtype=torch.int32),
+        heads,
+        qo_offset=torch.tensor([length - query_len], dtype=torch.int32),
+        device=device,
+    )
+    query = torch.randn(query_len, heads, 128, device=device).to(torch.float8_e4m3fn)
+    cache = torch.randn(pages, 256, 128, device=device).to(query.dtype)
+    table = torch.arange(pages, device=device, dtype=torch.int32)[None]
+    for rank in range(tp):
+        rows = 256 // tp
+        shard = cache[:, rank * rows : (rank + 1) * rows].contiguous()
+        dense = torch.empty(query_len, heads, blocks, device=device)
+        compact = torch.empty(query_len, heads, (blocks + 1) // 2, device=device)
+        common = dict(
+            q=query,
+            k=shard,
+            block_table=table,
+            plan_info=plan,
+            rank=rank,
+            tp=tp,
+            sm_scale=1.0,
+        )
+        fmha_index_score_sharded(**common, max_score=dense)
+
+        def score_compact():
+            fmha_index_score_sharded(
+                **common,
+                max_score=compact,
+                compact=True,
+                initialize=False,
+            )
+
+        offset = rank * 2 // tp
+        expected = dense[..., offset::2]
+        compact.fill_(1.0e9)
+        score_compact()
+        torch.testing.assert_close(
+            compact[..., : expected.shape[-1]], expected, rtol=0, atol=0
+        )
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            score_compact()
+        compact.fill_(2.0e9)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            compact[..., : expected.shape[-1]], expected, rtol=0, atol=0
+        )
+
+
 @pytest.mark.parametrize("tp,rank", [(2, 1), (4, 1), (4, 2), (4, 3)])
 @torch.inference_mode()
 def test_sharded_score_empty_rank_graph_replay(tp, rank):

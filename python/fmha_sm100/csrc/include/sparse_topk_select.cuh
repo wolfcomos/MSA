@@ -99,6 +99,13 @@ __device__ __forceinline__ bool IsForcedBlock(uint32_t k, uint32_t force_begin,
   return (k < force_begin) || (k >= force_end_start && k < row_num_valid_pages);
 }
 
+__device__ __forceinline__ uint32_t LocalPrefixCount(
+    uint32_t global_count, uint32_t index_scale, uint32_t index_offset) {
+  return global_count <= index_offset
+             ? 0u
+             : (global_count - 1u - index_offset) / index_scale + 1u;
+}
+
 __device__ __forceinline__ int32_t GatherBlockTableValue(
     const int32_t* __restrict__ block_table_row, uint64_t block_table_stride_k,
     int32_t logical_idx) {
@@ -781,11 +788,13 @@ struct SparseTopKPublish {
   uint32_t slot = 0, rank = 0, world = 0, heads_per_rank = 0, capacity = 0;
   uint32_t spin_limit = 0;
   uint32_t* generations = nullptr;
+  uint32_t index_scale = 1, index_offset = 0;
 
   // Warp 0 publishes tagged words or acquires/releases a legacy ready row.
   __device__ void operator()(uint32_t token, uint32_t head, const float* scores,
                             int32_t id) const {
     const uint32_t lane = threadIdx.x & 31;
+    const int32_t global_id = id >= 0 ? id * index_scale + index_offset : -1;
     int32_t* peer = reinterpret_cast<int32_t*>(recv_bases[head / heads_per_rank]);
     const size_t row_idx =
         ((static_cast<size_t>(slot) * world + rank) * heads_per_rank +
@@ -804,7 +813,7 @@ struct SparseTopKPublish {
         const uint64_t tag = static_cast<uint64_t>(generation) << 32;
         const uint64_t score =
             tag | __float_as_uint(id >= 0 ? scores[id] : -CUDART_INF_F);
-        const uint64_t index = tag | static_cast<uint32_t>(id);
+        const uint64_t index = tag | static_cast<uint32_t>(global_id);
         asm volatile("st.relaxed.sys.u64 [%0], %1;"
                      :: "l"(row + lane), "l"(score)
                      : "memory");
@@ -830,7 +839,7 @@ struct SparseTopKPublish {
     __syncwarp();
     if (lane < 16) {
       row[lane] = __float_as_int(id >= 0 ? scores[id] : -CUDART_INF_F);
-      row[16 + lane] = id;
+      row[16 + lane] = global_id;
     }
     __syncwarp();
     if (lane == 0) ready.store(1, cuda::memory_order_release);
@@ -840,14 +849,16 @@ struct SparseTopKPublish {
 struct SparseTopKPrefill {
   int32_t* carrier;
   uint64_t stride_h, stride_t;
+  uint32_t index_scale = 1, index_offset = 0;
 
   __device__ void operator()(uint32_t token, uint32_t head, const float* scores,
                             int32_t id) const {
     const uint32_t lane = threadIdx.x & 31;
+    const int32_t global_id = id >= 0 ? id * index_scale + index_offset : -1;
     int32_t* row = carrier + head * stride_h + token * stride_t;
     if (lane < 16) {
       row[lane] = __float_as_int(id >= 0 ? scores[id] : -CUDART_INF_F);
-      row[16 + lane] = id;
+      row[16 + lane] = global_id;
     }
     if (lane == 0) row[32] = 1;
   }
@@ -950,16 +961,24 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
   if constexpr (PUBLISH) {
     if (threadIdx.x == 0) SparseTopKLaunchDependentGrids(use_pdl);
   }
-  const uint32_t row_num_valid_pages =
+  const uint32_t global_num_valid_pages =
       LoadRowNumValidPages(num_valid_pages_per_token, t, num_valid_pages);
+  const uint32_t index_scale = PUBLISH ? publish.index_scale : 1;
+  const uint32_t index_offset = PUBLISH ? publish.index_offset : 0;
+  const uint32_t row_num_valid_pages =
+      LocalPrefixCount(global_num_valid_pages, index_scale, index_offset);
   // Padding is always -inf and can never be a useful sparse-attention page.
   // Restrict every histogram/refinement pass to the valid prefix instead of
   // repeatedly scanning max_k_tiles for rows with a large padded tail.
   const int rowEnd = static_cast<int>(
       row_num_valid_pages < max_k_tiles ? row_num_valid_pages : max_k_tiles);
   const int rowLen = rowEnd - rowStart;
+  const uint32_t force_begin_local =
+      LocalPrefixCount(force_begin, index_scale, index_offset);
+  const uint32_t global_force_end_start =
+      (force_end <= global_num_valid_pages) ? global_num_valid_pages - force_end : 0;
   const uint32_t force_end_start =
-      (force_end <= row_num_valid_pages) ? row_num_valid_pages - force_end : 0;
+      LocalPrefixCount(global_force_end_start, index_scale, index_offset);
 
   // If the actual valid page count fits in top-k, every valid page must be
   // emitted exactly once and the rest of the row is invalid padding.  Bypass the
@@ -1040,7 +1059,8 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
         const int idx = threadIdx.x + item * kNumThreadsPerBlock;
         if (idx < rowLen) {
           cachedLogits[item] =
-              IsForcedBlock(idx, force_begin, force_end_start, row_num_valid_pages)
+              IsForcedBlock(idx, force_begin_local, force_end_start,
+                            row_num_valid_pages)
                   ? FLT_MAX : logits[idx];
           cachedBins[item] = extractBinIdx<0>(cachedLogits[item]);
         }
@@ -1053,7 +1073,8 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
   if (kCompact && rowLen <= kNumFinalItems) {
     if (threadIdx.x < rowLen) {
       smemFinal.items.logits[threadIdx.x] =
-          IsForcedBlock(threadIdx.x, force_begin, force_end_start, row_num_valid_pages)
+          IsForcedBlock(threadIdx.x, force_begin_local, force_end_start,
+                        row_num_valid_pages)
               ? FLT_MAX : logits[threadIdx.x];
       smemFinal.items.indices[threadIdx.x] = threadIdx.x;
     }
@@ -1064,7 +1085,8 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
         processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
             smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-            force_begin, force_end_start, row_num_valid_pages, -1, cachedLogits, cachedBins);
+            force_begin_local, force_end_start, row_num_valid_pages, -1,
+            cachedLogits, cachedBins);
   }
 
   const int coarseThreshold = thresholdBinIdx;
@@ -1074,7 +1096,8 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
         processHistogramStep<1, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
             smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-            force_begin, force_end_start, row_num_valid_pages, -1, cachedLogits, cachedBins);
+            force_begin_local, force_end_start, row_num_valid_pages, -1,
+            cachedLogits, cachedBins);
   }
   if (continueToNextStep) {
     // Stage 2: fp32 mid 10 bits.
@@ -1082,7 +1105,7 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
         processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
             smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-            force_begin, force_end_start, row_num_valid_pages, coarseThreshold,
+            force_begin_local, force_end_start, row_num_valid_pages, coarseThreshold,
             cachedLogits, cachedBins);
   }
   if (continueToNextStep) {
@@ -1090,7 +1113,7 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
     const bool overflow = processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
         logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
         smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-        force_begin, force_end_start, row_num_valid_pages, coarseThreshold,
+        force_begin_local, force_end_start, row_num_valid_pages, coarseThreshold,
         cachedLogits, cachedBins);
     if constexpr (kCompact) {
       continueToNextStep = overflow;
@@ -1098,7 +1121,7 @@ __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> 
         processHistogramStep<4, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
             logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
             smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
-            force_begin, force_end_start, row_num_valid_pages, coarseThreshold,
+            force_begin_local, force_end_start, row_num_valid_pages, coarseThreshold,
             cachedLogits, cachedBins);
       }
     }

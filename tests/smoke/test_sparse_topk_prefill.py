@@ -10,6 +10,31 @@ from fmha_sm100 import sparse_topk_select_prefill
 from fmha_sm100.jit import get_sparse_topk_module
 
 
+@pytest.mark.parametrize("index_offset", [0, 1])
+def test_prefill_compact_ids_are_restored(index_offset):
+    scores = torch.arange(32, device="cuda", dtype=torch.float32)[None, None]
+    valid = torch.tensor([61], device="cuda", dtype=torch.int32)
+    carrier = torch.empty((1, 1, 33), device="cuda", dtype=torch.int32)
+    sparse_topk_select_prefill(
+        scores,
+        valid,
+        carrier,
+        force_begin_blocks=2,
+        force_end_blocks=3,
+        index_scale=2,
+        index_offset=index_offset,
+    )
+    global_ids = list(range(index_offset, 61, 2))
+    forced = {i for i in global_ids if i < 2 or i >= 58}
+    ordinary = [i for i in global_ids if i not in forced]
+    selected = forced | set(ordinary[-(16 - len(forced)) :])
+    assert carrier[0, 0, 16:32].cpu().tolist() == sorted(selected)
+    local_ids = [(i - index_offset) // 2 for i in sorted(selected)]
+    assert torch.equal(
+        carrier[0, 0, :16].cpu(), scores[0, 0, local_ids].view(torch.int32).cpu()
+    )
+
+
 @pytest.mark.parametrize("force_end", [0, 2])
 def test_prefill_cutoff_ties_use_stable_block_order(force_end):
     pages = 64
@@ -129,6 +154,8 @@ def test_prefill_compact_selection(pages, mode, force_begin, force_end, publish_
                     1 << 20,
                     False,
                     counters[rank],
+                    1,
+                    0,
                     torch.cuda.current_stream().cuda_stream,
                 )
             result = (

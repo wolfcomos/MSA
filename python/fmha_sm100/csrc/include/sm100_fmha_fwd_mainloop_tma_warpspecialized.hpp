@@ -174,9 +174,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   static constexpr bool kNeedOutput = (kSparseAttnMode != SparseAttnMode::OnlyScore) && !kNeedIcp;
   static constexpr bool kNeedSparse = kSparseAttnMode == SparseAttnMode::Sparse;
   static constexpr bool kNeedBlockCoord = kNeedSparse || kNeedIcp;
-  // OnlyScoreIcp packs kv_block_num = rank * 16 + world_size.
+  // OnlyScoreIcp packs world, rank, and the compact-score flag in kv_block_num.
   CUTLASS_DEVICE static int icp_c_of(int packed) { return packed & 15; }
-  CUTLASS_DEVICE static int icp_rank_of(int packed) { return packed >> 4; }
+  CUTLASS_DEVICE static int icp_rank_of(int packed) { return (packed >> 4) & 15; }
+  CUTLASS_DEVICE static bool icp_compact_score_of(int packed) { return packed & 256; }
   // OnlyScore mode: correction's only real work is writing max_score to GMEM
   // (rescale paths are kNeedOutput-gated). Let softmax do the GMEM write
   // directly from its tile_max register, and have correction skip its own
@@ -1141,8 +1142,15 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         // K-split stage 1 starts one tile past an odd tile count; ICP rows hold max_k_tiles.
         bool in_row = true;
         if constexpr (kNeedIcp) {
-          int block = Load::icp_global_row(k_tile_idx * KVPageSize, params.load.kv_block_num) / 128;
-          in_row = block < params.load.icp.max_k_tiles;
+          if (icp_compact_score_of(params.load.kv_block_num)) {
+            in_row = k_tile_idx < params.load.icp.max_k_tiles;
+          } else {
+            int block =
+                Load::icp_global_row(k_tile_idx * KVPageSize,
+                                     params.load.kv_block_num) /
+                128;
+            in_row = block < params.load.icp.max_k_tiles;
+          }
         }
         if (ms_base != nullptr && in_row) {
 #ifdef FMHA_GMEM_BOUNDS_CHECK
@@ -1537,7 +1545,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
           packed_maxscore_path();
         }
         if constexpr (kNeedIcp) {
-          if (KVPageSize * icp_c_of(params.load.kv_block_num) == 256) {
+          if (KVPageSize * icp_c_of(params.load.kv_block_num) == 256 &&
+              !icp_compact_score_of(params.load.kv_block_num)) {
             ms_base += icp_rank_of(params.load.kv_block_num) * KVPageSize / 128 * ms_stride_k;
             ms_stride_k *= 2;
           }

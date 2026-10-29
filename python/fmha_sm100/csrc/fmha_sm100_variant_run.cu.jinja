@@ -42,7 +42,8 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
                     bool qo_len_uniform,
                     int64_t stream_ptr{% if sparse_mode == "OnlyScoreIcp" %},
                     int64_t icp_rank,
-                    int64_t icp_c{% endif %}
+                    int64_t icp_c,
+                    bool compact_score{% endif %}
 {% if kv_mode >= 3 %}
                     ,
                     Optional<ffi::TensorView> maybe_nvfp4_k_data,
@@ -204,7 +205,10 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
                  && (page_size * icp_c == 128 || page_size * icp_c == 256))
       << "OnlyScoreIcp serves TP2/TP4 P128/P256 fragments; got icp_c=" << icp_c
       << " icp_rank=" << icp_rank << " page_size=" << page_size;
-  params.kv_block_num = static_cast<int>(icp_rank * 16 + icp_c);
+  TVM_FFI_ICHECK(!compact_score || page_size * icp_c == 256)
+      << "compact ICP scores require P256 fragments";
+  params.kv_block_num = static_cast<int>(icp_rank * 16 + icp_c
+                                         + (compact_score ? 256 : 0));
   TVM_FFI_ICHECK(maybe_kv_indices.has_value() && !maybe_kv_page_indptr.has_value()
                  && !maybe_kv_block_indexes.has_value())
       << "OnlyScoreIcp takes the block table as kv_indices and no other page directory";

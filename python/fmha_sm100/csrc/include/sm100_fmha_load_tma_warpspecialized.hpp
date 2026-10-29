@@ -107,7 +107,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
   // P128 is interleaved; P256 assigns each rank contiguous token rows.
   CUTLASS_DEVICE static int icp_global_row(int local_row, int packed_rank_c) {
     int W = packed_rank_c & 15;
-    int r = packed_rank_c >> 4;
+    int r = (packed_rank_c >> 4) & 15;
     if (KVPageSize * W == 256) {
       return (local_row / KVPageSize * W + r) * KVPageSize + local_row % KVPageSize;
     } else {
@@ -117,7 +117,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
 
   CUTLASS_DEVICE static int icp_local_rows(int kv_len, int packed_rank_c) {
     int W = packed_rank_c & 15;
-    int r = packed_rank_c >> 4;
+    int r = (packed_rank_c >> 4) & 15;
     if (KVPageSize * W == 256) {
       int full = kv_len / 256;
       return full * KVPageSize + max(0, min(KVPageSize, kv_len % 256 - r * KVPageSize));

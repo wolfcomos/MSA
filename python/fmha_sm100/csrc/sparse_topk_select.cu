@@ -158,6 +158,7 @@ void sparse_topk_select_publish(TensorView scores, TensorView num_valid_pages,
                                 int64_t force_begin, int64_t force_end,
                                 int64_t spin_limit, bool enable_pdl,
                                 Optional<TensorView> maybe_generations,
+                                int64_t index_scale, int64_t index_offset,
                                 int64_t stream_ptr) {
   CHECK_INPUT(scores);
   CHECK_DIM(3, scores);
@@ -183,6 +184,8 @@ void sparse_topk_select_publish(TensorView scores, TensorView num_valid_pages,
   TVM_FFI_ICHECK(slot >= 0 && slot < 3 && rank >= 0 && rank < world);
   TVM_FFI_ICHECK(force_begin >= 0 && force_end >= 0 && force_begin + force_end <= 16);
   TVM_FFI_ICHECK(spin_limit > 0 && spin_limit <= INT32_MAX);
+  TVM_FFI_ICHECK(index_scale >= 1 && index_scale <= 2 && index_offset >= 0 &&
+                 index_offset < index_scale);
   sparse_topk::SparseTopKPublish publish{
       TensorDataPtrConst<int64_t>(recv_bases), TensorDataPtr<int32_t>(errors),
       static_cast<uint32_t>(slot), static_cast<uint32_t>(rank),
@@ -200,10 +203,12 @@ void sparse_topk_select_publish(TensorView scores, TensorView num_valid_pages,
     publish.generations =
         reinterpret_cast<uint32_t*>(TensorDataPtr<int32_t>(generations));
   }
+  publish.index_scale = static_cast<uint32_t>(index_scale);
+  publish.index_offset = static_cast<uint32_t>(index_offset);
   const cudaError_t status = sparse_topk::LaunchIndexerTopK<true>(
       TensorDataPtrConst<float>(scores), nullptr, nullptr,
       0, 0, 0, 0, 0, 0, scores.size(0), scores.size(1), scores.size(2), 16,
-      scores.size(2), TensorDataPtrConst<int32_t>(num_valid_pages),
+      scores.size(2) * index_scale, TensorDataPtrConst<int32_t>(num_valid_pages),
       force_begin, force_end, /*input_qo_outermost=*/true,
       reinterpret_cast<cudaStream_t>(stream_ptr), enable_pdl, publish);
   TVM_FFI_ICHECK(status == cudaSuccess)
@@ -212,7 +217,8 @@ void sparse_topk_select_publish(TensorView scores, TensorView num_valid_pages,
 
 void sparse_topk_select_prefill(TensorView scores, TensorView num_valid_pages,
                                TensorView carrier, int64_t force_begin,
-                               int64_t force_end, int64_t stream_ptr) {
+                               int64_t force_end, int64_t index_scale,
+                               int64_t index_offset, int64_t stream_ptr) {
   CHECK_INPUT(scores);
   CHECK_INPUT(num_valid_pages);
   CHECK_CUDA(carrier);
@@ -231,13 +237,17 @@ void sparse_topk_select_prefill(TensorView scores, TensorView num_valid_pages,
   TVM_FFI_ICHECK(carrier.stride(2) == 1 && carrier.stride(1) >= 33 &&
                 carrier.stride(0) >= carrier.size(1) * carrier.stride(1));
   TVM_FFI_ICHECK(force_begin >= 0 && force_end >= 0 && force_begin + force_end <= 16);
+  TVM_FFI_ICHECK(index_scale >= 1 && index_scale <= 2 && index_offset >= 0 &&
+                 index_offset < index_scale);
   sparse_topk::SparseTopKPrefill publish{
       TensorDataPtr<int32_t>(carrier), static_cast<uint64_t>(carrier.stride(0)),
       static_cast<uint64_t>(carrier.stride(1))};
+  publish.index_scale = static_cast<uint32_t>(index_scale);
+  publish.index_offset = static_cast<uint32_t>(index_offset);
   const cudaError_t status = sparse_topk::LaunchIndexerTopK<true>(
       TensorDataPtrConst<float>(scores), nullptr, nullptr,
       0, 0, 0, 0, 0, 0, scores.size(0), scores.size(1), scores.size(2), 16,
-      scores.size(2), TensorDataPtrConst<int32_t>(num_valid_pages),
+      scores.size(2) * index_scale, TensorDataPtrConst<int32_t>(num_valid_pages),
       force_begin, force_end, /*input_qo_outermost=*/true,
       reinterpret_cast<cudaStream_t>(stream_ptr), /*enable_pdl=*/false, publish);
   TVM_FFI_ICHECK(status == cudaSuccess)

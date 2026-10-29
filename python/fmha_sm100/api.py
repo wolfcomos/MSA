@@ -1552,7 +1552,8 @@ def sparse_topk_select(
 
 
 def sparse_topk_select_prefill(scores, num_valid_pages, carrier, *,
-                             force_begin_blocks=0, force_end_blocks=0):
+                             force_begin_blocks=0, force_end_blocks=0,
+                             index_scale=1, index_offset=0):
     """Write local Top16 into a caller-owned int32 [H,T,33] candidate carrier.
 
     Scores are contiguous float32 [T,H,K], with int32 valid counts [T]. The
@@ -1565,6 +1566,7 @@ def sparse_topk_select_prefill(scores, num_valid_pages, carrier, *,
     get_sparse_topk_module().sparse_topk_select_prefill(
         scores, num_valid_pages, carrier,
         int(force_begin_blocks), int(force_end_blocks),
+        int(index_scale), int(index_offset),
         torch.cuda.current_stream().cuda_stream,
     )
 
@@ -1636,13 +1638,17 @@ def fmha_index_score_sharded_plan_device(
 
 
 def fmha_index_score_sharded(q, k, block_table, plan_info, *, rank,
-                             max_score, sm_scale, initialize=True, tp=2):
+                             max_score, sm_scale, initialize=True, tp=2,
+                             compact=False):
     """Score TP2/TP4 index K into bounded [T,H,B128] buffers.
 
     q is FP8 [T,H,128]. K pages hold 128/tp interleaved P128 rows or
     256/tp contiguous P256 rows; block_table contains physical page IDs.
-    With initialize=False, only the causal prefix is defined for P128;
-    P256 also requires initialization of blocks owned by other ranks.
+    Compact P256 scores use one local column per physical page; their TopK
+    caller restores the global B128 IDs with scale two and the rank offset.
+    With initialize=False, only the local causal prefix is defined. Compact
+    TP4 clears its half-width scratch because one rank in a B128 pair can have
+    no rows in the final page.
     Scores are raw QK maxima, matching the ordinary OnlyScore path.
     """
     if tp not in (2, 4) or not 0 <= rank < tp:
@@ -1655,11 +1661,16 @@ def fmha_index_score_sharded(q, k, block_table, plan_info, *, rank,
     if (plan_info.get("index_score_sharded_shape") != tuple(q.shape[:2]) or
             plan_info["pack_factor"] != 1 or plan_info["num_kv_splits"] != 1):
         raise ValueError("use fmha_index_score_sharded_plan for this query shape")
+    blocks_per_page = k.shape[1] * tp // 128
+    if compact and blocks_per_page != 2:
+        raise ValueError("compact index scores require P256 shards")
+    score_columns = plan_info["index_score_sharded_columns"]
+    if compact:
+        score_columns = (score_columns + 1) // 2
     if (max_score.ndim != 3 or tuple(max_score.shape[:2]) != tuple(q.shape[:2]) or
-            max_score.shape[-1] < max(1, plan_info["index_score_sharded_columns"]) or
+            max_score.shape[-1] < max(1, score_columns) or
             max_score.dtype != torch.float32):
         raise ValueError("expected float32 score scratch [T,H,K]")
-    blocks_per_page = k.shape[1] * tp // 128
     table_cols = (plan_info["index_score_sharded_columns"] + blocks_per_page - 1) // blocks_per_page
     if (block_table.ndim != 2 or block_table.dtype != torch.int32 or
             block_table.shape[0] != plan_info["qo_segment_lens"].shape[0] or
@@ -1672,7 +1683,7 @@ def fmha_index_score_sharded(q, k, block_table, plan_info, *, rank,
     max_qo_len = plan_info["max_qo_len"]
     variant = get_fmha_variant(_dlpack_dtype_code(q.dtype), 128, max_qo_len <= 64,
                               4, k.shape[1], False, 1)
-    if initialize or blocks_per_page == 2:
+    if initialize or (blocks_per_page == 2 and (not compact or tp == 4)):
         max_score.fill_(float("-inf"))
     variant.run(
         plan_info["cute_workspace_buffer"], q, k_pages, k_pages,
@@ -1684,5 +1695,5 @@ def fmha_index_score_sharded(q, k, block_table, plan_info, *, rank,
         128, block_table, None, max_score, max_score.shape[-1], None,
         1, bool(plan_info["qo_len_uniform"]),
         torch.cuda.current_stream(q.device).cuda_stream,
-        rank, tp,
+        rank, tp, bool(compact),
     )

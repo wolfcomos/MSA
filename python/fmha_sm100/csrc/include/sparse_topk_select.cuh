@@ -790,21 +790,46 @@ struct SparseTopKPublish {
   uint32_t* generations = nullptr;
   uint32_t index_scale = 1, index_offset = 0;
 
+  // A (token, head) row's receive slot and, in lane 0, its previous
+  // generation: loads a caller can issue early to hide behind its selection.
+  struct Target {
+    int32_t* peer;
+    size_t row_idx;
+    uint32_t* counter;
+    uint32_t previous;
+  };
+
+  __device__ Target Prepare(uint32_t token, uint32_t head) const {
+    Target target;
+    target.peer = reinterpret_cast<int32_t*>(recv_bases[head / heads_per_rank]);
+    target.row_idx = ((static_cast<size_t>(slot) * world + rank) * heads_per_rank +
+                      head % heads_per_rank) * capacity + token;
+    target.counter = nullptr;
+    target.previous = 0;
+    if (generations != nullptr) {
+      target.counter = generations +
+          (static_cast<size_t>(slot) * world * heads_per_rank + head) * capacity + token;
+      if ((threadIdx.x & 31) == 0) target.previous = *target.counter;
+    }
+    return target;
+  }
+
   // Warp 0 publishes tagged words or acquires/releases a legacy ready row.
   __device__ void operator()(uint32_t token, uint32_t head, const float* scores,
                             int32_t id) const {
+    Write(Prepare(token, head), scores, id);
+  }
+
+  __device__ void Write(const Target& target, const float* scores, int32_t id) const {
     const uint32_t lane = threadIdx.x & 31;
     const int32_t global_id = id >= 0 ? id * index_scale + index_offset : -1;
-    int32_t* peer = reinterpret_cast<int32_t*>(recv_bases[head / heads_per_rank]);
-    const size_t row_idx =
-        ((static_cast<size_t>(slot) * world + rank) * heads_per_rank +
-         head % heads_per_rank) * capacity + token;
-    if (generations != nullptr) {
-      uint32_t* counter = generations +
-          (static_cast<size_t>(slot) * world * heads_per_rank + head) * capacity + token;
+    int32_t* peer = target.peer;
+    const size_t row_idx = target.row_idx;
+    if (target.counter != nullptr) {
+      uint32_t* counter = target.counter;
       uint32_t generation = 0;
       if (lane == 0) {
-        generation = *counter + 1u;
+        generation = target.previous + 1u;
         if (generation == 0) generation = 1;
       }
       generation = __shfl_sync(0xffffffffu, generation, 0);
@@ -863,6 +888,234 @@ struct SparseTopKPrefill {
     if (lane == 0) row[32] = 1;
   }
 };
+
+// =============================================================================
+// SparseTopKPublishWarpKernel — decode publish, one warp per (token, head) row
+// =============================================================================
+//
+// A decode row has at most a few thousand local columns and keeps 16, so the
+// histogram CTA above spends most of a row's time in block barriers, and its
+// 512 threads leave two or three rows per SM: a step of thousands of rows runs
+// in waves.
+// Here one warp ranks a row exactly, in the merge's order: score descending
+// with forced pages as +inf, NaN as -inf and -0 as +0, then the lower column.
+//   1. Each lane keys its columns (lane + 32 * i) and keeps its largest key.
+//   2. At least 16 keys reach the 16th largest of the 32 lane maxima, so those
+//      keys hold the top 16.  Unless scores are adversarial, a couple of dozen
+//      do; up to kPublishMaxSurvivors of them are ranked against each other in
+//      shared memory, and a larger set falls back to 16 exact rounds over the
+//      row.
+//   3. The 16 columns are sorted ascending and published as before.
+// The receive slot and generation are read while the row is ranked.
+constexpr int kPublishWarpsPerBlock = 4;
+constexpr int kPublishMaxSurvivors = 64;
+constexpr int kPublishTopK = 16;
+
+// Larger keys rank first, as the merge ranks candidates: forced pages score
+// +inf, NaN -inf and -0 +0, and equal scores keep the lower column.  Columns
+// are below 2^14, so every real key is positive and 0 marks an empty slot.
+// Branch-free, so a score load is never sunk behind the forced test.
+__device__ __forceinline__ uint64_t PublishKey(float score, uint32_t column, bool forced) {
+  const uint32_t raw = __float_as_uint(isnan(score) ? -CUDART_INF_F : score);
+  const uint32_t bits = (raw & 0x7fffffffu) == 0 ? 0u : raw;
+  const uint32_t ordered = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+  const uint32_t positive_inf = 0xff800000u;  // ordered +inf
+  return (static_cast<uint64_t>(forced ? positive_inf : ordered) << 32) |
+         static_cast<uint32_t>(~column);
+}
+
+__device__ __forceinline__ uint64_t WarpMaxU64(uint64_t value) {
+  const uint32_t high = static_cast<uint32_t>(value >> 32);
+  const uint32_t best_high = __reduce_max_sync(0xffffffffu, high);
+  const uint32_t low = high == best_high ? static_cast<uint32_t>(value) : 0u;
+  const uint32_t best_low = __reduce_max_sync(0xffffffffu, low);
+  return (static_cast<uint64_t>(best_high) << 32) | best_low;
+}
+
+// The (kth + 1)-th largest of one key per lane, on every lane.
+__device__ __forceinline__ uint64_t WarpKthLargestU64(uint64_t key, uint32_t lane, int kth) {
+#pragma unroll
+  for (int size = 2; size <= 32; size *= 2) {
+#pragma unroll
+    for (int stride = size / 2; stride > 0; stride /= 2) {
+      const uint64_t other = __shfl_xor_sync(0xffffffffu, key, stride);
+      const bool descending = (lane & size) == 0;
+      const bool lower = (lane & stride) == 0;
+      const bool take_max = lower == descending;
+      key = take_max ? (other > key ? other : key) : (other < key ? other : key);
+    }
+  }
+  return __shfl_sync(0xffffffffu, key, kth);
+}
+
+// The first 32 * kLaneColumns columns of a row stay in registers, read before
+// the valid-page count is known. A longer row's other columns are read again
+// in each pass, kLaneColumns per lane at a time with all of those loads in
+// flight together.
+template <int kLaneColumns>
+__global__ void __launch_bounds__(32 * kPublishWarpsPerBlock) SparseTopKPublishWarpKernel(
+    const float* __restrict__ in,  // (T, H, K) row-contig fp32
+    uint32_t num_rows, uint32_t num_heads, uint32_t max_k_tiles, uint32_t num_valid_pages,
+    const int32_t* __restrict__ num_valid_pages_per_token, uint32_t force_begin,
+    uint32_t force_end, uint32_t use_pdl, SparseTopKPublish publish) {
+  __shared__ uint64_t smemSurvivors[kPublishWarpsPerBlock][kPublishMaxSurvivors];
+  __shared__ uint32_t smemSelected[kPublishWarpsPerBlock][kPublishTopK];
+  __shared__ uint32_t smemAscending[kPublishWarpsPerBlock][kPublishTopK];
+  __shared__ uint32_t smemSurvivorCount[kPublishWarpsPerBlock];
+
+  const uint32_t lane = threadIdx.x & 31;
+  const uint32_t warp = threadIdx.x >> 5;
+  const uint32_t row = blockIdx.x * kPublishWarpsPerBlock + warp;
+  SparseTopKWaitOnDependentGrids(use_pdl);
+  if (threadIdx.x == 0) SparseTopKLaunchDependentGrids(use_pdl);
+  if (row >= num_rows) return;
+  const uint32_t t = row / num_heads;
+  const uint32_t head = row - t * num_heads;
+  const float* logits = in + static_cast<size_t>(row) * max_k_tiles;
+  // The receive slot and generation load while the row is ranked.
+  const SparseTopKPublish::Target target = publish.Prepare(t, head);
+
+  // Register columns load while the valid-page count is in flight; the
+  // columns past it are masked below.
+  float cached[kLaneColumns];
+#pragma unroll
+  for (int i = 0; i < kLaneColumns; ++i) {
+    const uint32_t column = i * 32 + lane;
+    cached[i] = column < max_k_tiles ? logits[column] : 0.0f;
+  }
+  const uint32_t index_scale = publish.index_scale;
+  const uint32_t index_offset = publish.index_offset;
+  const uint32_t global_num_valid_pages =
+      LoadRowNumValidPages(num_valid_pages_per_token, t, num_valid_pages);
+  const uint32_t row_num_valid_pages =
+      LocalPrefixCount(global_num_valid_pages, index_scale, index_offset);
+  const uint32_t row_end =
+      row_num_valid_pages < max_k_tiles ? row_num_valid_pages : max_k_tiles;
+  if (row_end <= kPublishTopK) {
+    // Every valid column is selected.
+    publish.Write(target, logits, lane < row_end ? static_cast<int32_t>(lane) : -1);
+    return;
+  }
+  const uint32_t force_begin_local = LocalPrefixCount(force_begin, index_scale, index_offset);
+  const uint32_t global_force_end_start =
+      (force_end <= global_num_valid_pages) ? global_num_valid_pages - force_end : 0;
+  const uint32_t force_end_start =
+      LocalPrefixCount(global_force_end_start, index_scale, index_offset);
+  const uint32_t steps = (row_end + 31) / 32;
+  auto key_of = [&](uint32_t column, float score) {
+    return PublishKey(score, column,
+                      IsForcedBlock(column, force_begin_local, force_end_start,
+                                    row_num_valid_pages));
+  };
+  // Calls visit(valid, key) for each column past the register columns,
+  // kLaneColumns per lane at a time with all of their loads in flight.
+  auto for_each_streamed_key = [&](auto&& visit) {
+    for (uint32_t base = kLaneColumns; base < steps; base += kLaneColumns) {
+      float chunk[kLaneColumns];
+#pragma unroll
+      for (int i = 0; i < kLaneColumns; ++i) {
+        const uint32_t column = (base + i) * 32 + lane;
+        chunk[i] = column < row_end ? __ldg(logits + column) : 0.0f;
+      }
+#pragma unroll
+      for (int i = 0; i < kLaneColumns; ++i) {
+        if (base + i >= steps) break;
+        const uint32_t column = (base + i) * 32 + lane;
+        visit(column < row_end, key_of(column, chunk[i]));
+      }
+    }
+  };
+
+  // The first pass keys every column. A register column then keeps its key's
+  // high word (the ordered score) in place of the score, so the later passes
+  // rebuild its key from the column alone.
+  uint64_t lane_max = 0;
+#pragma unroll
+  for (int i = 0; i < kLaneColumns; ++i) {
+    if (static_cast<uint32_t>(i) >= steps) break;
+    const uint32_t column = i * 32 + lane;
+    const uint64_t key = column < row_end ? key_of(column, cached[i]) : 0;
+    cached[i] = __uint_as_float(static_cast<uint32_t>(key >> 32));
+    lane_max = key > lane_max ? key : lane_max;
+  }
+  for_each_streamed_key([&](bool valid, uint64_t key) {
+    if (valid && key > lane_max) lane_max = key;
+  });
+  // Calls visit(valid, key) for column 32 * step + lane.
+  auto for_each_key = [&](auto&& visit) {
+#pragma unroll
+    for (int i = 0; i < kLaneColumns; ++i) {
+      if (static_cast<uint32_t>(i) >= steps) break;
+      const uint32_t column = i * 32 + lane;
+      visit(column < row_end,
+            (static_cast<uint64_t>(__float_as_uint(cached[i])) << 32) |
+                static_cast<uint32_t>(~column));
+    }
+    for_each_streamed_key(visit);
+  };
+  // row_end > 16 gives at least 17 lanes a key, so the threshold is a real key.
+  const uint64_t threshold = WarpKthLargestU64(lane_max, lane, kPublishTopK - 1);
+
+  // Collect the keys at or above the threshold. Survivors are rare, so each
+  // takes a slot with a shared atomic; ranking below does not depend on the
+  // slot order.
+  uint64_t* survivors = smemSurvivors[warp];
+  uint32_t* selected = smemSelected[warp];
+  if (lane == 0) smemSurvivorCount[warp] = 0;
+  __syncwarp();
+  for_each_key([&](bool valid, uint64_t key) {
+    if (valid && key >= threshold) {
+      const uint32_t position = atomicAdd(&smemSurvivorCount[warp], 1u);
+      if (position < kPublishMaxSurvivors) survivors[position] = key;
+    }
+  });
+  __syncwarp();
+  const uint32_t total = smemSurvivorCount[warp];
+
+  if (total <= kPublishMaxSurvivors) {
+    // Keys are distinct, so exactly 16 survivors have fewer than 16 above them.
+    const uint64_t first = lane < total ? survivors[lane] : 0;
+    const uint64_t second = lane + 32 < total ? survivors[lane + 32] : 0;
+    uint32_t first_rank = 0, second_rank = 0;
+#pragma unroll 4
+    for (uint32_t j = 0; j < total; ++j) {
+      const uint64_t other = survivors[j];
+      first_rank += other > first;
+      second_rank += other > second;
+    }
+    if (lane < total && first_rank < kPublishTopK) {
+      selected[first_rank] = ~static_cast<uint32_t>(first);
+    }
+    if (lane + 32 < total && second_rank < kPublishTopK) {
+      selected[second_rank] = ~static_cast<uint32_t>(second);
+    }
+  } else {
+    // Exact rounds: each takes the largest key below the previous round's.
+    uint64_t previous = 0;
+    for (int round = 0; round < kPublishTopK; ++round) {
+      uint64_t best = 0;
+      for_each_key([&](bool valid, uint64_t key) {
+        if (valid && (round == 0 || key < previous) && key > best) best = key;
+      });
+      previous = WarpMaxU64(best);
+      if (lane == 0) selected[round] = ~static_cast<uint32_t>(previous);
+    }
+  }
+  __syncwarp();
+
+  // Publish the 16 distinct columns ascending: each counts the smaller ones.
+  uint32_t* ascending = smemAscending[warp];
+  if (lane < kPublishTopK) {
+    const uint32_t mine = selected[lane];
+    uint32_t position = 0;
+#pragma unroll
+    for (int j = 0; j < kPublishTopK; ++j) position += selected[j] < mine;
+    ascending[position] = mine;
+  }
+  __syncwarp();
+  const int32_t column = lane < kPublishTopK ? static_cast<int32_t>(ascending[lane]) : -1;
+  publish.Write(target, logits, column);
+}
 
 template <uint32_t MAX_TOPK, bool PUBLISH = false, typename Publisher = SparseTopKPublish>
 __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> ? 128 :
@@ -1367,6 +1620,49 @@ cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
   dim3 block(std::is_same_v<Publisher, SparseTopKPrefill> ? 128 : kIndexerNumThreadsPerBlock);
   return LaunchSparseTopKKernel((const void*)kernel, grid, block, args, dyn_smem_bytes,
                                 stream, enable_pdl);
+}
+
+template <int kLaneColumns>
+cudaError_t LaunchSparseTopKPublishWarpKernel(const float* in, uint32_t num_rows,
+                                              uint32_t num_heads, uint32_t max_k_tiles,
+                                              uint32_t num_valid_pages,
+                                              const int32_t* num_valid_pages_per_token,
+                                              uint32_t force_begin, uint32_t force_end,
+                                              cudaStream_t stream, bool enable_pdl,
+                                              SparseTopKPublish publish) {
+  auto kernel = SparseTopKPublishWarpKernel<kLaneColumns>;
+  const uint32_t use_pdl = enable_pdl ? 1u : 0u;
+  void* args[] = {(void*)&in, (void*)&num_rows, (void*)&num_heads, (void*)&max_k_tiles,
+                  (void*)&num_valid_pages, (void*)&num_valid_pages_per_token,
+                  (void*)&force_begin, (void*)&force_end, (void*)&use_pdl,
+                  (void*)&publish};
+  dim3 grid((num_rows + kPublishWarpsPerBlock - 1) / kPublishWarpsPerBlock);
+  dim3 block(32 * kPublishWarpsPerBlock);
+  return LaunchSparseTopKKernel((const void*)kernel, grid, block, args, 0, stream, enable_pdl);
+}
+
+// Decode publish TopK-16 of (T, H, K) row-contig scores, one warp per row.
+inline cudaError_t LaunchSparseTopKPublish(const float* in, uint32_t total_qo_len,
+                                           uint32_t num_heads, uint32_t max_k_tiles,
+                                           uint32_t num_valid_pages,
+                                           const int32_t* num_valid_pages_per_token,
+                                           uint32_t force_begin, uint32_t force_end,
+                                           cudaStream_t stream, bool enable_pdl,
+                                           SparseTopKPublish publish) {
+  const uint32_t num_rows = total_qo_len * num_heads;
+  if (num_rows == 0) return cudaSuccess;
+#define SPARSE_TOPK_PUBLISH_LAUNCH(COLUMNS)                                               \
+  LaunchSparseTopKPublishWarpKernel<COLUMNS>(in, num_rows, num_heads, max_k_tiles,       \
+                                             num_valid_pages, num_valid_pages_per_token, \
+                                             force_begin, force_end, stream, enable_pdl,  \
+                                             publish)
+  if (max_k_tiles <= 32 * 8) return SPARSE_TOPK_PUBLISH_LAUNCH(8);
+  if (max_k_tiles <= 32 * 16) return SPARSE_TOPK_PUBLISH_LAUNCH(16);
+  // Wider rows read further 768-column chunks: at a few thousand rows per step,
+  // 48 register columns per lane cost more in instruction issue than the
+  // chunk re-reads save.
+  return SPARSE_TOPK_PUBLISH_LAUNCH(24);
+#undef SPARSE_TOPK_PUBLISH_LAUNCH
 }
 
 cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transposed, int32_t* out,

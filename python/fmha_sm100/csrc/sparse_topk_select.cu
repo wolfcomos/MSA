@@ -205,12 +205,11 @@ void sparse_topk_select_publish(TensorView scores, TensorView num_valid_pages,
   }
   publish.index_scale = static_cast<uint32_t>(index_scale);
   publish.index_offset = static_cast<uint32_t>(index_offset);
-  const cudaError_t status = sparse_topk::LaunchIndexerTopK<true>(
-      TensorDataPtrConst<float>(scores), nullptr, nullptr,
-      0, 0, 0, 0, 0, 0, scores.size(0), scores.size(1), scores.size(2), 16,
+  const cudaError_t status = sparse_topk::LaunchSparseTopKPublish(
+      TensorDataPtrConst<float>(scores), scores.size(0), scores.size(1), scores.size(2),
       scores.size(2) * index_scale, TensorDataPtrConst<int32_t>(num_valid_pages),
-      force_begin, force_end, /*input_qo_outermost=*/true,
-      reinterpret_cast<cudaStream_t>(stream_ptr), enable_pdl, publish);
+      force_begin, force_end, reinterpret_cast<cudaStream_t>(stream_ptr), enable_pdl,
+      publish);
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "sparse_topk_select_publish failed: " << cudaGetErrorString(status);
 }

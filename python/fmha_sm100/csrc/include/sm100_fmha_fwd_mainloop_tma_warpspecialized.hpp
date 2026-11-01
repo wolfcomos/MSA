@@ -169,7 +169,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   static constexpr int KVPageSize = KVPageSize_;
 
   // OnlyScoreIcp: OnlyScore's epilogue with Sparse's block-coordinate machinery.
-  static constexpr bool kNeedIcp = (kSparseAttnMode == SparseAttnMode::OnlyScoreIcp);
+  static constexpr bool kNeedIcp =
+      kSparseAttnMode == SparseAttnMode::OnlyScoreIcp ||
+      kSparseAttnMode == SparseAttnMode::OnlyScoreIcpTopK;
+  static constexpr bool kFuseIcpTopK =
+      kSparseAttnMode == SparseAttnMode::OnlyScoreIcpTopK;
   static constexpr bool kNeedMaxScore = (kSparseAttnMode == SparseAttnMode::OnlyScore || kSparseAttnMode == SparseAttnMode::Full || kNeedIcp);
   static constexpr bool kNeedOutput = (kSparseAttnMode != SparseAttnMode::OnlyScore) && !kNeedIcp;
   static constexpr bool kNeedSparse = kSparseAttnMode == SparseAttnMode::Sparse;
@@ -988,15 +992,102 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     decltype(_dummy_storev()) tiled_tmem_storev;
     decltype(_dummy_store()) tiled_tmem_store;
     int thread_idx;
+    uint64_t icp_top_keys[16];
+    uint64_t icp_worst_key;
+    float icp_worst_score;
+    int icp_worst_slot;
+    int icp_valid_columns = 0;
+    int icp_force_begin = 0;
+    int icp_force_end_start = 0;
 
     // Hoisted partitions (Q-split only; K-split triggers nvcc miscompile)
     decltype(_dummy_thr_load().partition_S(_dummy_tStS())) tTMEM_LOADtS;
     decltype(_dummy_thr_storev().partition_D(_dummy_tStS_v())) tTMEM_STOREVtS;
     decltype(_dummy_thr_store().partition_D(_dummy_tStS_P())) tTMEM_STOREtS_x4;
 
+    CUTLASS_DEVICE static uint64_t icp_top_key(float score, int id, bool forced = false) {
+      uint32_t bits = __float_as_uint(score);
+      if (score == 0.0f) {
+        bits = 0;
+      }
+      uint32_t ordered = bits ^ ((bits & 0x80000000u) ? 0xffffffffu
+                                                       : 0x80000000u);
+      return (uint64_t(forced) << 63) | (uint64_t(ordered) << 31) |
+             (uint32_t(~id) & 0x7fffffffu);
+    }
+
+    CUTLASS_DEVICE static float icp_top_score(uint64_t key) {
+      uint32_t ordered = uint32_t(key >> 31);
+      uint32_t bits = ordered ^ ((ordered & 0x80000000u) ? 0x80000000u
+                                                         : 0xffffffffu);
+      return __uint_as_float(bits);
+    }
+
+    CUTLASS_DEVICE static int icp_top_id(uint64_t key) {
+      return int(~uint32_t(key) & 0x7fffffffu);
+    }
+
+    CUTLASS_DEVICE static int icp_local_columns(int global_count, int packed) {
+      const int scale = KVPageSize * icp_c_of(packed) / 128;
+      const int offset = icp_rank_of(packed) * KVPageSize / 128;
+      return max(0, (global_count + scale - 1 - offset) / scale);
+    }
+
+    template <bool Descending = false>
+    CUTLASS_DEVICE void icp_insert(float score, int id) {
+      if (id < 0 || id >= icp_valid_columns) return;
+      bool forced = id < icp_force_begin || id >= icp_force_end_start;
+      if constexpr (Descending) {
+        // Decreasing IDs win score ties; forced entries keep the full key order.
+        if (!forced && !(score >= icp_worst_score)) return;
+      }
+      if (score != score) return;
+      uint64_t candidate = icp_top_key(score, id, forced);
+      if ((Descending && !forced) || candidate > icp_worst_key) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < 16; ++i) {
+          if (icp_worst_slot == i) {
+            icp_top_keys[i] = candidate;
+          }
+        }
+
+        uint64_t worst_keys[8];
+        int worst_slots[8];
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < 8; ++i) {
+          bool right = icp_top_keys[2 * i + 1] < icp_top_keys[2 * i];
+          worst_keys[i] = right ? icp_top_keys[2 * i + 1] : icp_top_keys[2 * i];
+          worst_slots[i] = 2 * i + int(right);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int width = 4; width > 0; width /= 2) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < width; ++i) {
+            bool right = worst_keys[2 * i + 1] < worst_keys[2 * i];
+            worst_keys[i] = right ? worst_keys[2 * i + 1] : worst_keys[2 * i];
+            worst_slots[i] = right ? worst_slots[2 * i + 1] : worst_slots[2 * i];
+          }
+        }
+        icp_worst_key = worst_keys[0];
+        icp_worst_score = (icp_worst_key >> 63)
+            ? __uint_as_float(0x7fc00000u) : icp_top_score(icp_worst_key);
+        icp_worst_slot = worst_slots[0];
+      }
+    }
+
     // Constructor: order matters! compute each region fully before compose
     template <class Stage>
     CUTLASS_DEVICE SoftmaxCtx(Stage stage) {
+      if constexpr (kFuseIcpTopK) {
+        uint64_t invalid = icp_top_key(-INFINITY, INT_MAX);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < 16; ++i) {
+          icp_top_keys[i] = invalid;
+        }
+        icp_worst_key = invalid;
+        icp_worst_score = -INFINITY;
+        icp_worst_slot = 0;
+      }
       thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
 
       tStS = partition_fragment_C(typename CollectiveMmaQK::TiledMma{}, select<0, 1>(TileShapeQK{}));
@@ -1071,13 +1162,30 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       // read all of S from tmem into reg mem
       Tensor tTMEM_LOADrS = make_tensor<ElementQK>(shape(tTMEM_LOADcS));
+      ElementQK tile_max = -INFINITY;
+#if defined(CUTE_ARCH_TCGEN05_TMEM_STAT_ENABLED) && \
+    (defined(CUTLASS_ARCH_MMA_SM103A_ENABLED) || defined(CUTLASS_ARCH_MMA_SM103F_ENABLED))
+      constexpr bool use_tmem_max = kFuseIcpTopK && !need_apply_mask;
+#else
+      constexpr bool use_tmem_max = false;
+#endif
 
       // wait on tensor core pipe
       pipeline_s.consumer_wait(pipeline_s_consumer_state);
 
       {GPU_TRACE_SCOPE(SOFTMAX_Mask);
       if constexpr (!skip_computation) {
-        copy(tiled_tmem_load, l_tTMEM_LOADtS, tTMEM_LOADrS);
+#if defined(CUTE_ARCH_TCGEN05_TMEM_STAT_ENABLED) && \
+    (defined(CUTLASS_ARCH_MMA_SM103A_ENABLED) || defined(CUTLASS_ARCH_MMA_SM103F_ENABLED))
+        if constexpr (use_tmem_max) {
+          auto load_max = make_tmem_copy(SM100_TMEM_LOAD_STAT_32dp32b32x{}, tStS);
+          copy(load_max, l_tTMEM_LOADtS, tTMEM_LOADrS);
+          tile_max = ::fmax(-INFINITY, load_max.get_max());
+        } else
+#endif
+        {
+          copy(tiled_tmem_load, l_tTMEM_LOADtS, tTMEM_LOADrS);
+        }
         if constexpr (need_apply_mask) {
           if constexpr (kNeedIcp) {
             const int offset_q = Mask::get_qo_offset(problem_shape);
@@ -1096,32 +1204,39 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         }
       }}
 
+      if constexpr (direct_score_pipeline && kFuseIcpTopK) {
+        cutlass::arch::fence_view_async_tmem_load();
+        pipeline_s.consumer_release(pipeline_s_consumer_state);
+        ++pipeline_s_consumer_state;
+      }
+
       ElementQK old_row_max = row_max;
-      ElementQK tile_max = -INFINITY;
       {GPU_TRACE_SCOPE(SOFTMAX_GetMax);
       if constexpr (!skip_computation) {
-        // Off: start from row_max (fused running max, identical to original code)
-        // OnlyScore/Full: start from -inf to get per-tile max separately
-        float init_val;
-        if constexpr (!kNeedMaxScore) {
-          init_val = row_max;
-        } else {
-          init_val = -INFINITY;
+        if constexpr (!use_tmem_max) {
+          // Off: start from row_max (fused running max, identical to original code)
+          // OnlyScore/Full: start from -inf to get per-tile max separately
+          float init_val;
+          if constexpr (!kNeedMaxScore) {
+            init_val = row_max;
+          } else {
+            init_val = -INFINITY;
+          }
+          float tile_max_0 = init_val;
+          float tile_max_1 = init_val;
+          float tile_max_2 = init_val;
+          float tile_max_3 = init_val;
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(tTMEM_LOADrS); i += 4) {
+            tile_max_0 = ::fmax(tile_max_0, tTMEM_LOADrS(i));
+            tile_max_1 = ::fmax(tile_max_1, tTMEM_LOADrS(i + 1));
+            tile_max_2 = ::fmax(tile_max_2, tTMEM_LOADrS(i + 2));
+            tile_max_3 = ::fmax(tile_max_3, tTMEM_LOADrS(i + 3));
+          }
+          tile_max = ::fmax(tile_max_0, tile_max_1);
+          tile_max = ::fmax(tile_max, tile_max_2);
+          tile_max = ::fmax(tile_max, tile_max_3);
         }
-        float tile_max_0 = init_val;
-        float tile_max_1 = init_val;
-        float tile_max_2 = init_val;
-        float tile_max_3 = init_val;
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(tTMEM_LOADrS); i += 4) {
-          tile_max_0 = ::fmax(tile_max_0, tTMEM_LOADrS(i));
-          tile_max_1 = ::fmax(tile_max_1, tTMEM_LOADrS(i + 1));
-          tile_max_2 = ::fmax(tile_max_2, tTMEM_LOADrS(i + 2));
-          tile_max_3 = ::fmax(tile_max_3, tTMEM_LOADrS(i + 3));
-        }
-        tile_max = ::fmax(tile_max_0, tile_max_1);
-        tile_max = ::fmax(tile_max, tile_max_2);
-        tile_max = ::fmax(tile_max, tile_max_3);
         if constexpr (kNeedMaxScore) {
           row_max = ::fmax(row_max, tile_max);
         } else {
@@ -1141,7 +1256,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       if constexpr (kFuseMaxScoreIntoSoftmax) {
         // K-split stage 1 starts one tile past an odd tile count; ICP rows hold max_k_tiles.
         bool in_row = true;
-        if constexpr (kNeedIcp) {
+        if constexpr (kNeedIcp && !kFuseIcpTopK) {
           if (icp_compact_score_of(params.load.kv_block_num)) {
             in_row = k_tile_idx < params.load.icp.max_k_tiles;
           } else {
@@ -1152,7 +1267,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
             in_row = block < params.load.icp.max_k_tiles;
           }
         }
-        if (ms_base != nullptr && in_row) {
+        if constexpr (kFuseIcpTopK) {
+          icp_insert<true>(tile_max, k_tile_idx);
+        } else if (ms_base != nullptr && in_row) {
 #ifdef FMHA_GMEM_BOUNDS_CHECK
           gmem_stwt_checked(ms_base + k_tile_idx * ms_stride_k, tile_max,
                             ms_check_base, ms_check_numel, "max_score_stwt");
@@ -1259,15 +1376,15 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
             l_tTMEM_STOREtS_x4(_, _, size<2>(tTMEM_STORErS_x4) - 1));
       }
 
-      if constexpr (direct_score_pipeline) {
-        // No P/V-statistic store here: fence the S load before returning S to MMA.
-        cutlass::arch::fence_view_async_tmem_load();
-      } else {
-        cutlass::arch::fence_view_async_tmem_store();
+      if constexpr (!(direct_score_pipeline && kFuseIcpTopK)) {
+        if constexpr (direct_score_pipeline) {
+          cutlass::arch::fence_view_async_tmem_load();
+        } else {
+          cutlass::arch::fence_view_async_tmem_store();
+        }
+        pipeline_s.consumer_release(pipeline_s_consumer_state);
+        ++pipeline_s_consumer_state;
       }
-
-      pipeline_s.consumer_release(pipeline_s_consumer_state);
-      ++pipeline_s_consumer_state;
 
       if constexpr (!direct_score_pipeline) {
         pipeline_c.producer_acquire(pipeline_c_producer_state);
@@ -1509,6 +1626,17 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
                   + local_row;
 
       uint qo_len = uint(get<0>(problem_shape));
+      if constexpr (kFuseIcpTopK) {
+        const int packed = params.load.kv_block_num;
+        const int count = uint(abs_row) < qo_len
+            ? (min(int(get<1>(problem_shape)), Mask::get_qo_offset(problem_shape) +
+                   abs_row + 1) + 127) / 128 : 0;
+        softmax_ctx.icp_valid_columns = SoftmaxCtx::icp_local_columns(count, packed);
+        softmax_ctx.icp_force_begin =
+            SoftmaxCtx::icp_local_columns(params.load.icp.force_begin_blocks, packed);
+        const int end_start = max(0, count - params.load.icp.force_end_blocks);
+        softmax_ctx.icp_force_end_start = SoftmaxCtx::icp_local_columns(end_start, packed);
+      }
       if (uint(abs_row) < qo_len) {
         int qo_head_idx = get<2, 0>(blk_coord);
         int batch_idx = get<2, 1>(blk_coord);
@@ -1690,6 +1818,35 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       pipeline_c.producer_commit(pipeline_c_producer_state);
       ++pipeline_c_producer_state;
       pipeline_c.producer_acquire(pipeline_c_producer_state);
+    }
+    if constexpr (kFuseIcpTopK) {
+      if (ms_base != nullptr) {
+        // A causal B128 tail may exist before this rank owns its first token.
+        const int tail = softmax_ctx.icp_valid_columns - 1;
+        if (tail >= effective_end * kTilesPerMacro &&
+            tail % kTilesPerMacro == int(stage) % kTilesPerMacro) {
+          softmax_ctx.icp_insert(-INFINITY, tail);
+        }
+        int slot = int(stage) * 16;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < 16; ++i) {
+          float score = softmax_ctx.icp_top_score(softmax_ctx.icp_top_keys[i]);
+          int id = softmax_ctx.icp_top_id(softmax_ctx.icp_top_keys[i]);
+          if (id == INT_MAX) id = -1;
+#ifdef FMHA_GMEM_BOUNDS_CHECK
+          gmem_stwt_checked(ms_base + (slot + i) * ms_stride_k,
+                            score, ms_check_base,
+                            ms_check_numel, "icp_top_score_stwt");
+          gmem_stwt_checked(ms_base + (32 + slot + i) * ms_stride_k,
+                            __int_as_float(id),
+                            ms_check_base, ms_check_numel, "icp_top_id_stwt");
+#else
+          __stwt(ms_base + (slot + i) * ms_stride_k, score);
+          __stwt(ms_base + (32 + slot + i) * ms_stride_k,
+                 __int_as_float(id));
+#endif
+        }
+      }
     }
     RELEASE_GPU_TRACE;
   }
@@ -2433,6 +2590,30 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   CUTLASS_DEVICE void complete_icp_score_rows(
       BlkCoord const& blk_coord, Params const& params, ProblemShape const& problem_shape,
       ParamsProblemShape const& params_problem_shape, CollectiveEpilogue const& epilogue) {
+    if constexpr (kFuseIcpTopK) {
+      if (Load::icp_local_blocks_exact(int(get<1>(problem_shape)),
+                                       params.load.kv_block_num) != 0) return;
+      const int begin = int(get<0>(blk_coord)) * int(get<0>(TileShape{}));
+      const int end = min(begin + int(get<0>(TileShape{})), int(get<0>(problem_shape)));
+      const int offset_q = Mask::get_qo_offset(problem_shape);
+      const int packed = params.load.kv_block_num;
+      const int batch = get<2, 1>(blk_coord);
+      const int segments = get<3, 1>(params_problem_shape) + 1;
+      const int segment = SEG_OFF_LOAD(get<0>(params_problem_shape), batch, segments);
+      Tensor scores = make_tensor(make_gmem_ptr(epilogue.params.ptr_MaxScore),
+                                   epilogue.params.layout_MaxScore);
+      for (int row = begin + threadIdx.x % 128; row < end; row += 128) {
+        const int count = (min(int(get<1>(problem_shape)), offset_q + row + 1) + 127) / 128;
+        const int columns = SoftmaxCtx::icp_local_columns(count, packed);
+        CUTLASS_PRAGMA_UNROLL
+        for (int slot = 0; slot < 32; ++slot) {
+          scores(segment + row, get<2, 0>(blk_coord), slot) = -INFINITY;
+          scores(segment + row, get<2, 0>(blk_coord), 32 + slot) =
+              __int_as_float(slot < min(16, columns) ? slot : -1);
+        }
+      }
+      return;
+    }
     if (KVPageSize * icp_c_of(params.load.kv_block_num) != 128) return;
     constexpr int kColumnsPerTrip = get<1>(ThreadShape{});
     int covered = Load::icp_local_blocks_exact(int(get<1>(problem_shape)),

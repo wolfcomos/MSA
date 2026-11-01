@@ -43,7 +43,9 @@ enum class SparseAttnMode {
   Full,
   Sparse,
   // Score this rank's index-K shard.
-  OnlyScoreIcp
+  OnlyScoreIcp,
+  // Score the shard and retain only each softmax stage's local Top16.
+  OnlyScoreIcpTopK
 };
 
 struct NoMask {

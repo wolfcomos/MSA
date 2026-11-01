@@ -254,6 +254,51 @@ void sparse_topk_select_prefill(TensorView scores, TensorView num_valid_pages,
       << "sparse_topk_select_prefill failed: " << cudaGetErrorString(status);
 }
 
+void sparse_topk_merge_prefill_partials(TensorView partials, TensorView carrier,
+                                        int64_t index_scale, int64_t index_offset,
+                                        Optional<TensorView> maybe_num_valid_pages,
+                                        int64_t force_begin, int64_t force_end,
+                                        int64_t stream_ptr) {
+  CHECK_INPUT(partials);
+  CHECK_CUDA(carrier);
+  CHECK_DIM(3, partials);
+  CHECK_DIM(3, carrier);
+  CHECK_DEVICE(partials, carrier);
+  TVM_FFI_ICHECK(encode_dlpack_dtype(partials.dtype()) == float32_code);
+  TVM_FFI_ICHECK(encode_dlpack_dtype(carrier.dtype()) == int32_code);
+  TVM_FFI_ICHECK(partials.size(2) >= 64 && partials.stride(2) == 1);
+  TVM_FFI_ICHECK(carrier.size(0) == partials.size(1) &&
+                 carrier.size(1) == partials.size(0) && carrier.size(2) == 33);
+  TVM_FFI_ICHECK(carrier.stride(2) == 1 && carrier.stride(1) >= 33 &&
+                 carrier.stride(0) >= carrier.size(1) * carrier.stride(1));
+  TVM_FFI_ICHECK(index_scale >= 1 && index_scale <= 2 && index_offset >= 0 &&
+                 index_offset < index_scale);
+  TVM_FFI_ICHECK(force_begin >= 0 && force_end >= 0 && force_begin + force_end <= 16);
+  TVM_FFI_ICHECK(maybe_num_valid_pages.has_value() || (force_begin == 0 && force_end == 0));
+  const int32_t* num_valid_pages = nullptr;
+  if (maybe_num_valid_pages.has_value()) {
+    const auto valid = maybe_num_valid_pages.value();
+    CHECK_INPUT(valid);
+    CHECK_DIM(1, valid);
+    CHECK_DEVICE(partials, valid);
+    TVM_FFI_ICHECK(encode_dlpack_dtype(valid.dtype()) == int32_code &&
+                   valid.size(0) == partials.size(0));
+    num_valid_pages = TensorDataPtrConst<int32_t>(valid);
+  }
+  const int64_t rows = partials.size(0) * partials.size(1);
+  if (rows == 0) return;
+  sparse_topk::IcpPrefillMergePartialsKernel<<<rows, 32, 0,
+      reinterpret_cast<cudaStream_t>(stream_ptr)>>>(
+      TensorDataPtrConst<float>(partials), partials.stride(0), partials.stride(1),
+      TensorDataPtr<int32_t>(carrier), carrier.stride(0), carrier.stride(1),
+      partials.size(1), index_scale, index_offset, num_valid_pages, force_begin, force_end);
+  const cudaError_t status = cudaGetLastError();
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "sparse_topk_merge_prefill_partials failed: " << cudaGetErrorString(status);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_merge_prefill_partials,
+                              sparse_topk_merge_prefill_partials);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_select_prefill, sparse_topk_select_prefill);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_select_publish, sparse_topk_select_publish);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_select_init, sparse_topk_select_init);

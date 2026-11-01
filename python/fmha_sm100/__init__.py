@@ -13,6 +13,7 @@ _DENSE_LAZY_EXPORTS = frozenset(
         "fmha_sm100_plan",
         "sparse_topk_select",
         "sparse_topk_select_prefill",
+        "sparse_topk_merge_prefill_partials",
     }
 )
 

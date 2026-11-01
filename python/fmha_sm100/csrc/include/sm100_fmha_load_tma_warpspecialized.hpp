@@ -80,6 +80,8 @@ struct MaskPackFactor<PackedCausalMask<P>> { static constexpr int value = P; };
 struct IcpParams {
   int max_k_tiles = 0;
   int block_table_row_stride = 0;
+  int force_begin_blocks = 0;
+  int force_end_blocks = 0;
 };
 
 template <class Element, class CollectiveMmaQK, class CollectiveMmaPV, class SmemLayoutQ,
@@ -90,7 +92,9 @@ struct Sm100FmhaLoadTmaWarpspecialized {
   // P0: OnlyScore mode never reads V — skip every V slot in the KV pipeline.
   // mma() gates the matching wait_V/release_V under `kNeedOutput` so producer
   // (loader) and consumer (mma) stay step-locked on the pipeline state.
-  static constexpr bool kNeedIcp = (kSparseAttnMode == SparseAttnMode::OnlyScoreIcp);
+  static constexpr bool kNeedIcp =
+      kSparseAttnMode == SparseAttnMode::OnlyScoreIcp ||
+      kSparseAttnMode == SparseAttnMode::OnlyScoreIcpTopK;
   static constexpr bool kNeedV = (kSparseAttnMode != SparseAttnMode::OnlyScore) && !kNeedIcp;
 
   using TileShapeQK = typename CollectiveMmaQK::TileShape;

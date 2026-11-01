@@ -49,6 +49,7 @@
 #include <math_constants.h>
 
 #include <cfloat>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -863,6 +864,75 @@ struct SparseTopKPrefill {
     if (lane == 0) row[32] = 1;
   }
 };
+
+__global__ void IcpPrefillMergePartialsKernel(
+    const float* __restrict__ partials, uint64_t partial_stride_t,
+    uint64_t partial_stride_h, int32_t* __restrict__ carrier,
+    uint64_t carrier_stride_h, uint64_t carrier_stride_t,
+    uint32_t num_qo_heads, uint32_t index_scale, uint32_t index_offset,
+    const int32_t* __restrict__ num_valid_pages,
+    uint32_t force_begin, uint32_t force_end) {
+  const uint32_t lane = threadIdx.x;
+  const uint32_t token = blockIdx.x / num_qo_heads;
+  const uint32_t head = blockIdx.x % num_qo_heads;
+  const float* row_in = partials + static_cast<size_t>(token) * partial_stride_t +
+                        static_cast<size_t>(head) * partial_stride_h;
+  float score = row_in[lane];
+  const int local_id = __float_as_int(row_in[32 + lane]);
+  const bool valid = local_id >= 0 && local_id != INT_MAX && !isnan(score);
+  const int mapped_id = valid ? local_id * static_cast<int>(index_scale) +
+                                   static_cast<int>(index_offset) : -1;
+  const uint32_t count = num_valid_pages == nullptr ? 0 : max(0, num_valid_pages[token]);
+  const uint32_t end_start = count > force_end ? count - force_end : 0;
+  const bool forced = valid && IsForcedBlock(mapped_id, force_begin, end_start, count);
+  // The two stage lists are disjoint. Keep raw scores, including signed zero,
+  // alongside the ID and forced tag throughout the sorting network.
+  uint32_t tagged_id = valid ? uint32_t(local_id) | (uint32_t(forced) << 31)
+                             : uint32_t(INT_MAX);
+  if (!valid) score = -CUDART_INF_F;
+  constexpr uint32_t kMask = 0xFFFFFFFFu;
+#pragma unroll
+  for (int k = 2; k <= 32; k *= 2) {
+#pragma unroll
+    for (int j = k / 2; j > 0; j /= 2) {
+      const float other_score = __shfl_xor_sync(kMask, score, j);
+      const uint32_t other_id = __shfl_xor_sync(kMask, tagged_id, j);
+      const bool other_better = ((tagged_id ^ other_id) & 0x80000000u)
+          ? other_id > tagged_id
+          : other_score > score ||
+            (other_score == score && (other_id & 0x7fffffffu) <
+                                      (tagged_id & 0x7fffffffu));
+      const bool keep_better = ((lane & j) == 0) == ((lane & k) == 0);
+      if (other_better == keep_better) {
+        score = other_score;
+        tagged_id = other_id;
+      }
+    }
+  }
+  uint32_t id = tagged_id & 0x7fffffffu;
+#pragma unroll
+  for (int k = 2; k <= 16; k *= 2) {
+#pragma unroll
+    for (int j = k / 2; j > 0; j /= 2) {
+      const float other_score = __shfl_xor_sync(kMask, score, j);
+      const uint32_t other_id = __shfl_xor_sync(kMask, id, j);
+      const bool keep_lower = ((lane & j) == 0) == ((lane & k) == 0);
+      if ((other_id < id) == keep_lower) {
+        score = other_score;
+        id = other_id;
+      }
+    }
+  }
+  int32_t* row_out = carrier + static_cast<size_t>(head) * carrier_stride_h +
+                     static_cast<size_t>(token) * carrier_stride_t;
+  if (lane < 16) {
+    row_out[lane] = __float_as_int(score);
+    row_out[16 + lane] = id == INT_MAX ? -1 :
+        static_cast<int>(id * index_scale + index_offset);
+  }
+  __syncwarp();
+  if (lane == 0) row_out[32] = 1;
+}
 
 template <uint32_t MAX_TOPK, bool PUBLISH = false, typename Publisher = SparseTopKPublish>
 __global__ void __launch_bounds__((std::is_same_v<Publisher, SparseTopKPrefill> ? 128 :

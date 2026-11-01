@@ -7,6 +7,99 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize("tp,page_size", [(2, 128), (2, 256), (4, 128), (4, 256)])
+@pytest.mark.parametrize(
+    "query_len,length,force_begin,force_end,tied",
+    [(5, 8193, 0, 0, False), (1, 1, 0, 0, False),
+     (257, 8449, 2, 3, False), (65, 8193, 2, 3, True)],
+)
+@torch.inference_mode()
+def test_sharded_score_fused_topk_matches_materialized_scores(
+    tp, page_size, query_len, length, force_begin, force_end, tied
+):
+    from fmha_sm100.api import (
+        fmha_index_score_sharded,
+        fmha_index_score_sharded_plan,
+        sparse_topk_merge_prefill_partials,
+        sparse_topk_select_prefill,
+    )
+
+    torch.manual_seed(19)
+    device, heads = torch.device("cuda"), 4
+    blocks = (length + 127) // 128
+    pages = (length + page_size - 1) // page_size
+    prefix = length - query_len
+    plan = fmha_index_score_sharded_plan(
+        torch.tensor([query_len], dtype=torch.int32),
+        torch.tensor([length], dtype=torch.int32),
+        heads,
+        qo_offset=torch.tensor([prefix], dtype=torch.int32),
+        device=device,
+    )
+    query = torch.randn(query_len, heads, 128, device=device).to(torch.float8_e4m3fn)
+    if tied:
+        query.zero_()
+    cache = torch.randn(pages, page_size, 128, device=device).to(query.dtype)
+    table = torch.arange(pages, device=device, dtype=torch.int32)[None]
+    valid = (
+        torch.arange(query_len, device=device, dtype=torch.int32) + prefix + 128
+    ) // 128
+    compact = page_size == 256
+    index_scale = 2 if compact else 1
+
+    for rank in range(tp):
+        rows = page_size // tp
+        shard = (
+            cache[:, rank::tp]
+            if page_size == 128
+            else cache[:, rank * rows : (rank + 1) * rows]
+        ).contiguous()
+        score_columns = (blocks + index_scale - 1) // index_scale
+        scores = torch.empty(query_len, heads, score_columns, device=device)
+        partials = torch.empty(query_len, heads, 64, device=device)
+        expected = torch.empty(heads, query_len, 33, device=device, dtype=torch.int32)
+        actual = torch.empty_like(expected)
+        common = dict(
+            q=query,
+            k=shard,
+            block_table=table,
+            plan_info=plan,
+            rank=rank,
+            tp=tp,
+            sm_scale=1.0,
+            compact=compact,
+        )
+        fmha_index_score_sharded(**common, max_score=scores)
+        index_offset = rank * index_scale // tp
+        sparse_topk_select_prefill(
+            scores,
+            valid,
+            expected,
+            index_scale=index_scale,
+            index_offset=index_offset,
+            force_begin_blocks=force_begin,
+            force_end_blocks=force_end,
+        )
+        fmha_index_score_sharded(
+            **common,
+            max_score=partials,
+            fused_topk=True,
+            initialize=False,
+            force_begin_blocks=force_begin,
+            force_end_blocks=force_end,
+        )
+        sparse_topk_merge_prefill_partials(
+            partials,
+            actual,
+            index_scale=index_scale,
+            index_offset=index_offset,
+            num_valid_pages=valid,
+            force_begin_blocks=force_begin,
+            force_end_blocks=force_end,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("tp", [2, 4])
 @torch.inference_mode()
 def test_sharded_score_p256_compact_columns(tp):

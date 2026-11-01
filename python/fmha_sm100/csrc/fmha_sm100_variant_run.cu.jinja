@@ -40,10 +40,12 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
                     Optional<ffi::TensorView> maybe_kv_block_indexes,
                     int64_t pack_factor,
                     bool qo_len_uniform,
-                    int64_t stream_ptr{% if sparse_mode == "OnlyScoreIcp" %},
+                    int64_t stream_ptr{% if sparse_mode in ["OnlyScoreIcp", "OnlyScoreIcpTopK"] %},
                     int64_t icp_rank,
                     int64_t icp_c,
-                    bool compact_score{% endif %}
+                    bool compact_score{% endif %}{% if sparse_mode == "OnlyScoreIcpTopK" %},
+                    int64_t force_begin_blocks,
+                    int64_t force_end_blocks{% endif %}
 {% if kv_mode >= 3 %}
                     ,
                     Optional<ffi::TensorView> maybe_nvfp4_k_data,
@@ -198,7 +200,7 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
   params.kv_block_indexes_ptr = kv_block_indexes_ptr;
   params.kv_block_num = maybe_kv_block_indexes.has_value()
                             ? static_cast<int>(maybe_kv_block_indexes.value().size(2))
-                            : 0;{% if sparse_mode == "OnlyScoreIcp" %}
+                            : 0;{% if sparse_mode in ["OnlyScoreIcp", "OnlyScoreIcpTopK"] %}
   // OnlyScoreIcp: kv_indices is the block table; rank and world size ride kv_block_num.
   TVM_FFI_ICHECK((icp_c == 2 || icp_c == 4) && icp_rank >= 0 && icp_rank < icp_c
                  && page_size == {{ page_size }}
@@ -220,6 +222,12 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
   TVM_FFI_ICHECK(params.batch_size <= block_table.size(0))
       << "ICP block table must have one row per query segment";
   params.icp_block_table_row_stride = static_cast<int>(block_table.stride(0));
+{% if sparse_mode == "OnlyScoreIcpTopK" %}
+  TVM_FFI_ICHECK(force_begin_blocks >= 0 && force_end_blocks >= 0 &&
+                 force_begin_blocks + force_end_blocks <= 16);
+  params.icp_force_begin_blocks = static_cast<int>(force_begin_blocks);
+  params.icp_force_end_blocks = static_cast<int>(force_end_blocks);
+{% endif %}
   TVM_FFI_ICHECK(maybe_max_score.has_value()
                  && maybe_max_score.value().size(0) == q.size(0)
                  && maybe_max_score.value().size(1) == q.size(1))
@@ -311,7 +319,7 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
   params.gmem_bounds.kv_page_indptr_size = maybe_kv_page_indptr.has_value()
       ? static_cast<int>(maybe_kv_page_indptr.value().size(0)) : 0;
   params.gmem_bounds.kv_indices_size = maybe_kv_indices.has_value()
-      ? static_cast<int>(maybe_kv_indices.value().size(0)) : 0;{% if sparse_mode == "OnlyScoreIcp" %}
+      ? static_cast<int>(maybe_kv_indices.value().size(0)) : 0;{% if sparse_mode in ["OnlyScoreIcp", "OnlyScoreIcpTopK"] %}
   params.gmem_bounds.kv_indices_size =
       static_cast<int>(maybe_kv_indices.value().size(0) * maybe_kv_indices.value().stride(0));{% endif %}
   params.gmem_bounds.max_score_numel = maybe_max_score.has_value()

@@ -80,6 +80,7 @@ _FMHA_SM100_DISPATCH = [
         (2,    {"sparse_mode": "OnlyScore"}),
         (None, {"sparse_mode": "Off"}),
         (4,    {"sparse_mode": "OnlyScoreIcp"}),
+        (5,    {"sparse_mode": "OnlyScoreIcpTopK"}),
     ]),
     ("int page_size", [
         (-1,  {"page_size": -1}),
@@ -117,8 +118,9 @@ _FMHA_SM100_IMPOSSIBLE = lambda p: (
     (p.get("tile_q") == "_256" and p.get("is_split_kv") == "true") or
     (p.get("page_size") == -1 and p.get("sparse_mode") == "Sparse") or
     (p.get("pack_factor", 1) > 1 and p.get("tile_q") == "_256") or
-    (p.get("page_size") in (32, 64) and p.get("sparse_mode") != "OnlyScoreIcp") or
-    (p.get("sparse_mode") == "OnlyScoreIcp" and (
+    (p.get("page_size") in (32, 64) and p.get("sparse_mode") not in
+     ("OnlyScoreIcp", "OnlyScoreIcpTopK")) or
+    (p.get("sparse_mode") in ("OnlyScoreIcp", "OnlyScoreIcpTopK") and (
         p.get("page_size") not in (32, 64, 128) or
         p.get("dtype_in") != "__nv_fp8_e4m3" or p.get("tile_q") != "_128" or
         p.get("is_split_kv") == "true" or p.get("pack_factor", 1) != 1 or
@@ -161,7 +163,7 @@ def _variant_key_from_runtime(dtype_code, qo_tile_size, single_wg,
                 return idx
         return fallback_idx
 
-    if sparse_mode != 4 and page_size not in (-1, 128):
+    if sparse_mode not in (4, 5) and page_size not in (-1, 128):
         page_size = 128
     runtime_vals = [dtype_code, qo_tile_size, single_wg, sparse_mode,
                     page_size, split_kv, pack_factor]

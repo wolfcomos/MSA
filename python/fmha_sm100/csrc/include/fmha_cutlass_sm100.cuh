@@ -85,7 +85,8 @@ struct FwdRunner {
   // NumQStages: 2 for Q-split (2,1,1), 1 for K-split (1,2,1)
   static constexpr int NumQStages = cute::size<0>(ThreadShape{});
   static constexpr bool kIcp =
-      kSparseAttnMode == cutlass::fmha::collective::SparseAttnMode::OnlyScoreIcp;
+      kSparseAttnMode == cutlass::fmha::collective::SparseAttnMode::OnlyScoreIcp ||
+      kSparseAttnMode == cutlass::fmha::collective::SparseAttnMode::OnlyScoreIcpTopK;
   static constexpr bool bNeedOutput =
       kSparseAttnMode != cutlass::fmha::collective::SparseAttnMode::OnlyScore && !kIcp;
   static constexpr int kPackFactor = cutlass::fmha::collective::pack_factor_of<ActiveMask>::value;
